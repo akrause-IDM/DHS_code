@@ -1,0 +1,968 @@
+################################################################################
+#################    EXPLORING CONTRACEPTIVE TRANSITIONS    ####################
+################################################################################
+
+# Phase 1 Data Exploration
+# Prepared by Ana Krause
+# Created in October 2025
+
+############################# SESSION SET UP ###################################
+
+rm(list=ls()) ##clean environment
+dir <- "~/Dropbox/DHS_Data/Contraceptive_Transitions"
+setwd(dir)
+
+#Note: drawing from the relevant women's datasets (IR) (as defined under code description: https://dhsprogram.com/data/File-Types-and-Names.cfm)
+
+library(tidyverse)
+library(scales)
+library(sf)
+library(plyr)
+library(dplyr)
+library(readstata13)
+library(gdata)
+library(lubridate)
+library(ggplot2)
+
+
+#Add Michelle's Code to conduct multi-country data extraction, updated for full contraceptive calendar analysis per IPUMS DHS
+varlist <- c("v000", #country-survey code
+             "caseid", #Case Identification for contraceptive calendar analysis
+             "v001", #cluster
+             "v005", #ind weights
+             "v007", #year of interview
+             "v008", #date of interview (CMC)
+             "v011", #respondent's age (CMC)
+             "v012", #respondent age
+             "v018", #Row of month of interview (need for calendar data analysis)
+             "v021", #primary sampling unit
+             "v022", #sample stratum, needed to address v023 missingness
+             "v023", #Sample domain, national or country specific
+             "v024", #Region, needed to address v023 missingness
+             "v025", #urban-rural,  needed to address v023 missingness
+             "v040", #Cluster altitude in meters
+             "v101", #region
+             "v130", #religion
+             "v133", #education in years
+             "vcal_1", #birth/preg/FP calendar
+             "v019", #length of calendar (MUST bring this in with vcal_1 if using)
+             "v213", #currently pregnant
+             "v218", #living children
+             "v209", #births in past year
+             "v212", #age at first birth
+             # "v221", #marriage to first birth interval
+             "v222", #last birth to interview
+             "v190", #wealth index
+             "v155", #literacy
+             "v140", #urban-rural & de-jure
+             "v149", #educational attainment
+             "v302", "v302a", #ever use any method
+             "v311", #number of children at first use
+             "v312", #contraceptive method at current moment
+             "v228", #terminated pregnancy ever
+             "v301", #knowledge of any method
+             "v624", #unmet need def 1
+             "v626", #unmet need def 2
+             "v525", #"Age at first sex"
+             "v527", #"Time since last sex"
+             "v528", #"Time since last sex (in days)"
+             "v529", #"Time since last sex (in months)"
+             "v531", #"Age at first sex (imputed)"
+             "v501", #"Ever been married or in union"
+             "v536", #"Recent sexual activity"
+             "v326", #last source for current users (public/private/other)
+             "v359", #last method discontinued in past five years
+             "v360", #reason for discontinuation
+             "v362", #intention to use/timing of intent
+             "v375a", #main reason not using
+             "v376", #main reason not to use
+             "v376a", #would ever use if married
+             "v632", "v632a", #Decision-making about use/non-use
+             "v362", "v364", #desire to use FP at any point in future
+             "v3a08a", "v3a08b", "v3a08c", "v3a08d", "v3a08e", "v3a08f", "v3a08g","v3a08h","v3a08i", "v3a08j",
+             "v3a08k","v3a08l","v3a08m","v3a08n","v3a08o","v3a08p","v3a08q","v3a08r","v3a08s","v3a08t","v3a08u","v3a08v","v3a08w",
+             "v3a08x","v3a08y","v3a08z","v3a08aa","v3a08ab","v3a08ac","v3a08ad" #reasons for non-use
+)
+
+temp = list.files(pattern="*.DTA") #list all files in the working directory with extension
+
+for (i in 1:length(temp)) assign(temp[i], read.dta13(temp[i], select.cols = varlist))  #bring in all files in folder with selected variables
+
+dfs = sapply(.GlobalEnv, is.data.frame) #list all dataframes in the environment
+
+
+dhs <- do.call(rbind.fill, mget(names(dfs)[dfs])) #bind all the dataframes in environment, missing columns filled in
+
+## note: if package purrr is installed, keep will draw from purrr and not base
+keep(dhs, sure = T) #remove all datasets except dhs, to preserve memory/space
+
+dhs$country_code <- gsub("[[:digit:]]","",dhs$v000)
+dhs$survey_round <- gsub("[^[:digit:]]", "", dhs$v000)
+
+save(dhs, file = "dhs.csv")
+
+## note: if package purrr is installed, keep will draw from purrr and not base
+keep(dhs, sure = T) #remove all datasets except dhs, to preserve memory/space
+
+
+dhs$country_code <- gsub("[[:digit:]]","",dhs$v000)
+dhs$survey_round <- gsub("[^[:digit:]]", "", dhs$v000)
+
+#save(dhs, file = "dhs.csv")
+
+table(dhs$country_code)
+table(dhs$country_code, dhs$v312)
+table(dhs$country_code, dhs$v101)
+
+# table(dhs$v101)
+
+##cmc translation
+dhs$int_date <- (1900+(dhs$v008/12))
+
+# Run this to be able to use the data.table package for efficiency with large datasets
+library(data.table)
+dhs <- data.table(dhs)
+
+
+##################### DATA EXPLORATION ############################
+
+###QUICK REFRESH ###
+#The general outcome of interest? modern contraceptive prevalence (mCPR) & mCPR rate of change
+#Our interventions of interest are new modern methods of contraception being available in the countries of interest
+#There is no control group
+#Our data is from 1986-2020 (country dependent) & for our main analysis we with use the contraceptive calendar data (longitudinal)
+
+#How many rows (observations) are in my dataset?
+nrow(dhs)
+
+#What variables are in my dataset?
+names(dhs)
+
+#How are the individual variables structured?
+
+### - Explore for each variable: 
+### -- 1. Is it continuous or categorical? 
+### -- 2. How many unique values are there? (binary, 3 unique values, 4 unique values, 500/basically continuous?)
+### -- 3. Are there any NAs?
+### -- 4. If continuous, any outliers?
+### -- 5. What does each row represent for that variable? 
+
+### Exploring variables ----
+
+#country-survey code
+dplyr::count(dhs, v000) #30 rows, no NA, but seem to be missing CO6, RW, ZW2. Confirmed that present in directory (COIR61FL.DTA, etc.) Will cross-check with survey years
+
+#Checking survey year & country by year 
+crosstab_yr_info <- dhs %>%
+  group_by(v000, v007) %>%
+  tally(name = "n") %>%
+  ungroup() %>%
+  pivot_wider(names_from = v000, values_from = n, values_fill = list(n = 0))
+#OK these seem to be OK, Colombia has all the correct years per survey list on DHS website (https://dhsprogram.com/Countries/Country-List.cfm)
+
+#cluster
+dplyr::count(dhs, v001) #17,323 rows, no NAs
+
+#ind weights
+dplyr::count(dhs, v005) #39,479 rows, no NAs
+
+#Country Code
+dplyr::count(dhs, country_code)
+#all 4 countries included, although note far fewer obs for ZW & RW than other countries. They do have smaller populations
+
+#respondent's age (CMC)
+dplyr::count(dhs, v011) #826 rows, no NAs
+
+#respondent's age
+dplyr::count(dhs, v012) #37 rows, no NAs. Age ranges from 13 years to 49 years
+
+#primary sampling unit
+dplyr::count(dhs, v021) #5073 rows, many NAs (30,325)
+
+#Let's dig into this missingness a bit more just to make sure not specific missingness 
+dplyr::group_by(dhs, v000) %>%
+  dplyr::summarise(
+    n = dplyr::n(),
+    n_v021_missing = sum(is.na(v021)),
+    pct_v021_missing = 100 * n_v021_missing / dplyr::n()
+  ) %>%
+  dplyr::arrange(desc(pct_v021_missing))
+#Well it would appear that sampling units were not included in any of the initial surveys for CO, EG, ID, & ZW as all have 100% missingness for this variable. Since first DHS in Rwanda did not occur until 1992 it appears OK
+#Per DHS guidance can replace missing v021 with cluster from v001
+
+#Let's create a new v021_fixed variable that does this
+dhs <- dhs %>%
+  mutate(v021_fixed = coalesce(v021, v001))
+
+#Let's check if this worked.
+dplyr::count(dhs, v021_fixed) #it did! no missingness
+
+#contraceptive method at current moment
+dplyr::count(dhs, v312)
+#52 rows, with some duplicates, 1 NA (without Rwanda), 10,158 NA with Rwanda. Will need to combine some as "injection 1 months" and "monthly injection" likely same. Will do some more exploration:
+#Note in Rwanda, there is a BCP with iron (microgynon Fe: mjf), only 17 responses in dataset
+
+#Locate the 1 NA value (not from Rwanda) for your v312
+na_entry <- dhs %>%
+  filter(is.na(v312)) %>%
+  select(country_code, int_date)
+
+na_entry #from Indonesia in 1988
+
+# Define the injection-related terms from v312
+injection_terms <- c("injections", 
+                     "injections 3 month", 
+                     "injection 1 months", 
+                     "monthy injection", 
+                     "injections every three months", 
+                     "injection (3 monthly)", 
+                     "injection (monthly)")
+
+crosstab_inj_info <- dhs %>%
+  filter(v312 %in% injection_terms) %>%
+  group_by(country_code, v312) %>%
+  tally(name = "n") %>%
+  ungroup() %>%
+  pivot_wider(names_from = v312, values_from = n, values_fill = list(n = 0))
+#OK these seem to just be different terms by country (e.g. Colombia uses: monthly injection vs. Egypt injection (monthly))
+
+#Add the year to the cross-tab
+crosstab_inj_info_yr <- dhs %>%
+  filter(v312 %in% injection_terms) %>%
+  group_by(country_code, int_date, v312) %>%
+  tally(name = "n") %>%
+  ungroup() %>%
+  pivot_wider(names_from = v312, values_from = n, values_fill = list(n = 0))
+
+#Let's harmonize these terms to: injections, injections 3 months, & injection 1 months & also for the implant as we have "norplant" and "implants/norplant" & others just to be tidy
+dhs <- dhs %>%
+  mutate(v312 = as.character(v312) %>% str_squish() %>% tolower(),
+         v312_harmon = case_when(
+           v312 == "injections" ~ "injections",
+           v312 %in% c("injections 3 month", "injections every three months", "injection (3 monthly)") ~ "injections 3 months",
+           v312 %in% c("injection 1 months", "injection (monthly)", "monthy injection") ~ "injection 1 months",
+           v312 %in% c("norplant", "implants/norplant") ~ "implants/norplant",
+           v312 %in% c("standard days method", "standard days method (sdm)", "methods of fixed days: cs methods") ~ "standard days method",
+           v312 %in% c("massage", "massage (urut,pijat)", "pijat (massage)") ~ "massage (all names)",
+           v312 %in% c("prolonged breastfeeding", "prolonged breastfeed", "prolonged breastfdng", "prolonged breastfdg") ~ "prolonged breastfeeding",
+           v312 %in% c("diaphragm/foam/jelly", "diaphragm/ foam/ jelly", "diaphragm, foam, jelly", "diaphragm /foam/jelly", "diaphragm", "foam or jelly", "foam/jelly") ~ "diaphragm/foam/jelly",
+           v312 %in% c("jamu jamu (herbs)", "herbal medicine", "herbs", "herbs (jamu)") ~ "herbs",
+           v312 %in% c("lactational amenorrhea", "lactational amenorrhea (lam)") ~ "lactational amenorrhea",
+           v312 %in% c("pill", "mjf") ~ "pill",
+           TRUE ~ v312
+         ))
+
+# check harmonized values
+dplyr::count(dhs, v312_harmon) #it worked!
+
+# Let's subset v312_harmon to just the 5 methods of interest (pill, EC, implants, injections, & IUD)
+study_methods <- c(
+  "emergency contraception",
+  "implants/norplant",
+  "injection 1 months",
+  "injections",
+  "injections 3 months",
+  "iud",
+  "pill"
+)
+
+dhs <- dhs %>%
+  mutate(
+    v312_modern = tolower(trimws(as.character(v312_harmon))),
+    study_methods = ifelse(v312_modern %in% study_methods, v312_modern, NA_character_)
+  )
+
+# check
+table(dhs$study_methods, useNA = "ifany")
+
+#Wealth Index
+dplyr::count(dhs, v190) #There are 5 wealth quintiles (although need to harmonize upper & lowercase), and a lot of NAs (219,963) across the 5 case study countries
+
+#Let's harmonize these terms to all lower case
+dhs <- dhs %>%
+  mutate(
+    v190 = as.character(v190) %>% str_squish() %>% tolower(),
+    v190_harmon = case_when(
+      is.na(v190) ~ NA_character_,
+      v190 %in% c("poorest", "Poorest") ~ "poorest",
+      v190 %in% c("poorer", "Poorer")   ~ "poorer",
+      v190 %in% c("middle", "Middle")   ~ "middle",
+      v190 %in% c("richer", "Richer")   ~ "richer",
+      v190 %in% c("richest", "Richest") ~ "richest",
+      TRUE                              ~ v190
+    )
+  )
+
+# check harmonized values
+dplyr::count(dhs, v190_harmon) #it worked!
+
+#Literacy
+dplyr::count(dhs, v155) # There are 8 responses, also a lot of NAs (326,202) across the 4 case study countries
+
+#Rurality
+dplyr::count(dhs, v140) # there are 8 responses, with some missingness (30,893) however I can harmonize the 4 non de jure residents into one
+
+#Let's harmonize these terms to "not a dejure resident"
+dhs <- dhs %>%
+  mutate(v140 = as.character(v140) %>% str_squish() %>% tolower(),
+         v140_harmon = case_when(
+           v140 == "not a dejure resident" ~ "not a dejure resident",
+           v140 %in% c("not dejure resident", "not a de-jure resident", "not a de jure resident") ~ "not a dejure resident",
+           TRUE ~ v140
+         ))
+
+# check harmonized values
+dplyr::count(dhs, v140_harmon) #it worked!
+
+#Level of Educational Attainment
+dplyr::count(dhs, v149) # there are 14 responses, with some missingness (30,330) & I could combine some duplicate termps
+
+#Let's find out where the less clear/numerical responses (0, 1, 2, 3, 4, 5, 9) come from 
+crosstab_educ_info <- dhs %>%
+  group_by(country_code, v149) %>%
+  tally(name = "n") %>%
+  ungroup() %>%
+  pivot_wider(names_from = v149, values_from = n, values_fill = list(n = 0))
+#OK all come from Indonesia
+
+#Add the year to the cross-tab to cross-check with the original survey
+crosstab_educ_info_yr <- dhs %>%
+  group_by(country_code, v149, int_date) %>%
+  tally(name = "n") %>%
+  ungroup() %>%
+  pivot_wider(names_from = v149, values_from = n, values_fill = list(n = 0))
+#Answer: it was the 2007/08 DHS for Indonesia, which is DHS-V. Per the questionnaire (https://dhsprogram.com/pubs/pdf/FR218/FR218%5B27August2010%5D.pdf) for Q108
+# 1 = primary
+# 2 = junior high school
+# 3 = senior high school
+# 4 = Academy
+# 5 = University
+# but 0 & 9 don't fit....however per DHS recode (https://www.dhsprogram.com/pubs/pdf/DHSG4/Recode7_DHS_10Sep2018_DHSG4.pdf) the 9 = missing and confirms that 0=no education
+
+#Let's harmonize these terms to all lower case
+dhs <- dhs %>%
+  mutate(
+    v149 = as.character(v149) %>% str_squish() %>% tolower(),
+    v149_harmon = case_when(
+      is.na(v149) ~ NA_character_,
+      v149 %in% c("9") ~ NA_character_,
+      v149 %in% c("complete primary", "Complete primary", "1") ~ "complete primary",
+      v149 %in% c("complete secondary", "Complete secondary", "3")   ~ "complete secondary",
+      v149 %in% c("higher", "Higher", "4", "5")   ~ "higher",
+      v149 %in% c("incomplete primary", "Incomplete primary")   ~ "incomplete primary",
+      v149 %in% c("incomplete secondary", "Incomplete secondary", "2") ~ "incomplete secondary",
+      v149 %in% c("no education", "No education", "0") ~ "no education",
+      TRUE                              ~ v149
+    )
+  )
+
+# check harmonized values
+dplyr::count(dhs, v149_harmon) #it worked!
+
+#Let's check education in years
+dplyr::count(dhs, v133) #this is much more complete, 28 responses including 98 (don't know) & 99 (missing), also 853 NA (up from 116 without Rwanda)
+
+#Ever used any method
+dplyr::count(dhs, v302) # there are 7 responses, with some missingness (188,081) & I could combine these
+
+#Let's harmonize these terms to so "used only folkloric" & "used only folkloric method" are one, etc.
+dhs <- dhs %>%
+  mutate(v302 = as.character(v302) %>% str_squish() %>% tolower(),
+         v302_harmon = case_when(
+           v302 %in% c("used only folkloric", "used only folkloric method") ~ "used only folkloric method",
+           v302 %in% c("used only trad. meth", "used only traditional method") ~ "used only traditional method",
+           TRUE ~ v302
+         ))
+
+# check harmonized values
+dplyr::count(dhs, v302_harmon) #it worked!
+
+#Ever used any method in the calendar
+dplyr::count(dhs, v302a) # there are 4 responses, with some missingness (489,623), nothing to combine. 88,364 within calendar
+
+#Year of the interview
+dplyr::count(dhs, v007) #there are 33 values from ?1 to 2017. Pre-1999 are coded as 2 digits. Need to figure out what 1 means as there are 32,895 responses
+
+#Let's find out where the less clear/numerical response of 1 comes from 
+crosstab_year_info <- dhs %>%
+  group_by(country_code, v007) %>%
+  tally(name = "n") %>%
+  ungroup() %>%
+  pivot_wider(names_from = v007, values_from = n, values_fill = list(n = 0))
+#OK all come from Indonesia
+
+# 1) Inspect rows with v007 == 1
+dhs %>% filter(as.character(v007) %in% c("1","01")) %>% select(v007, v008, country_code, survey_round, everything()) %>% slice_head(n = 50)
+
+# 2) If v008 is DHS CMC (century month code), convert to a calendar year:
+#    DHS CMC: month number = v008; year = floor((v008 - 1) / 12) + 1900
+#    (this formula assumes CMC origin at Jan 1900 as in DHS)
+dhs <- dhs %>%
+  mutate(v008 = as.integer(as.character(v008)),
+         v008_year = if_else(!is.na(v008),
+                             floor((v008 - 1) / 12) + 1900L,
+                             NA_integer_))
+
+# 3) Show the mismatches and specifically the v007 == 1 cases with inferred year
+dhs %>%
+  filter(as.integer(as.character(v007)) == 1) %>%
+  select(country_code, survey_round, v007, v008, v008_year, everything()) %>%
+  arrange(country_code, v008_year) %>%
+  print(n = Inf)
+
+# 4) For general cross-check across dataset, show rows where v007 differs from v008_year
+dhs %>%
+  mutate(v007_int = as.integer(as.character(v007))) %>%
+  filter(!is.na(v008_year) & !is.na(v007_int) & v007_int != v008_year) %>%
+  select(country_code, survey_round, v007, v008, v008_year) %>%
+  arrange(country_code, v008_year) %>%
+  print(n = 100)
+
+# 5) Correct v007 where it is obviously wrong & replace with v008 year
+dhs <- dhs %>%
+  mutate(
+    v007 = as.integer(as.character(v007)),
+    v008 = as.integer(as.character(v008)),
+    v008_year = if_else(!is.na(v008), floor((v008 - 1) / 12) + 1900L, NA_integer_),
+    v007_fixed = if_else(!is.na(v007) & v007 == 1 & !is.na(v008_year), v008_year, v007)
+  )
+
+# Verify correction
+dhs %>% filter(v007 == 1) %>% select(v007, v007_fixed, v008, v008_year) %>% print(n = Inf)
+
+#Let's adjust so all year values are 4 digits
+dhs <- dhs %>%
+  mutate(v007_fixed = as.integer(as.character(v007_fixed)))
+
+dhs <- dhs %>%
+  mutate(v007_fixed = case_when(
+    v007_fixed >= 86 & v007_fixed <= 99 ~ 1900L + v007_fixed,
+    v007_fixed >= 100                  ~ v007_fixed,
+    TRUE                               ~ NA_integer_
+  ))
+
+# check harmonized column
+dplyr::count(dhs, v007_fixed) #it worked!
+
+#Let's also check which countries I have v312_harmon data for & which years
+summary_long_v312_data <- dhs %>%
+  group_by(country_code, v007_fixed) %>%
+  summarise(
+    n = n(),
+    n_v312_nonmiss = sum(!is.na(v312_harmon)),
+    pct_v312_present = 100 * n_v312_nonmiss / n,
+    .groups = "drop"
+  ) %>%
+  arrange(country_code, v007_fixed)
+
+summary_long_v312_data #cross-checked with data availability on website, see PPT Table in Appendix
+
+#last source for current users (public/private/other)
+dplyr::count(dhs, v326) # 264 possible values, this will need a lot of cleaning if using as country specific, also a lot of NA (316,045)
+
+#reason for discontinuation
+dplyr::count(dhs, v360) #89 possible values, in Spanish/English, need a lot more cleaning, also a lot of missingness (457,889)
+
+#Let's find out where the less clear/numerical responses (1-16) come from, 98 = don't know
+crosstab_disc_info <- dhs %>%
+  group_by(country_code, v360, survey_round) %>%
+  tally(name = "n") %>%
+  ungroup() %>%
+  pivot_wider(names_from = v360, values_from = n, values_fill = list(n = 0))
+#OK come from all except Colombia, from multiple survey rounds 4, 5, & 6. Have cross-checked recode DHS maps (see Excel spreadsheet for reference), only ones that don't align are 15 & 16
+
+#Let's harmonize these terms
+dhs <- dhs %>%
+  mutate(
+    v360 = as.character(v360) %>% str_squish() %>% tolower(),
+    v360_harmon = case_when(
+      is.na(v360) ~ NA_character_,
+      v360 %in% c("99", "9", "16") ~ NA_character_,
+      v360 %in% c("wanted more effective method", "wanted more eff.meth", "7") ~ "wanted more effective method",
+      v360 %in% c("access /availability", "access, availability", "dispon/accesibilidad", "difficult to obtain", "6")   ~ "access /availability",
+      v360 %in% c("husband disapproved", "husband disappr", "husband disapproves", "oposicion del marido", "3")   ~ "husband disapproved",
+      v360 %in% c("infrequent sex", "infreq. sex", "sexo infrecuente")   ~ "infrequent sex",
+      v360 %in% c("infreq.sex,husb away", "infrequent sex, husband away", "husband away/ill", "husband illness", "9") ~ "husband away/ill",
+      v360 %in% c("iud expelled", "iud fell out") ~ "iud expelled",
+      v360 %in% c("wanted to become pregnant", "wanted to become prg") ~ "wanted to become pregnant",
+      v360 %in% c("other", "otro", "14") ~ "other",
+      v360 %in% c("method failed", "metodo fallo") ~ "method failed",
+      v360 %in% c("cost", "cost too much", "costo", "costs too much", "10") ~ "cost",
+      v360 %in% c("advice of doctor", "medical advice") ~ "medical advice",
+      v360 %in% c("wanted to become pregnant", "to get pregnant", "para embarazarse", "husband wants her pregnant", "2") ~ "wanted to become pregnant",
+      v360 %in% c("side effects", "side effects chd.", "efectos secundarios", "side effects_resp.", "4") ~ "side effects",
+      v360 %in% c("changed method", "cambie de metodo", "switch method / brand", "use other method") ~ "switch method / brand",
+      v360 %in% c("became widow,divorce", "death of spouse", "divorced, widowed", "marital dissolution", "marital dissolution/ separation", "13") ~ "divorced, widowed",
+      v360 %in% c("fatalistic", "fatalista", "11") ~ "fatalistic",
+      v360 %in% c("amen/can t get preg", "can't get pregnant") ~ "can't get pregnant",
+      v360 %in% c("diff.preg.,menopause", "difficult to get pregnat, menopausal", "difficult pregnancy, menopause", "can't get pregnant easily", "12") ~ "difficult to get pregnant, menopausal",
+      v360 %in% c("no sabe", "don't know", "98", "15") ~ "don't know",
+      v360 %in% c("religious /moral", "oth rel disaprvd") ~ "religious /moral",
+      v360 %in% c("problemas de salud", "health concerns", "5") ~ "health concerns",
+      v360 %in% c("inconvenient to use", "dificil de usar", "8") ~ "inconvenient to use",
+      v360 %in% c("became pregnant", "thinks she is pregnant", "1") ~ "became pregnant",
+      v360 %in% c("method failed", "became pregnant while using") ~ "method failed/became pregnant while using",
+      TRUE                              ~ v360
+    )
+  )
+
+# check harmonized values
+dplyr::count(dhs, v360_harmon) #it worked!
+
+#intention to use/timing of intent
+dplyr::count(dhs, v362) #12 possible values, will need to harmonize numerical (2, 4, 5, 6, 9). Per recode manual (2:Use later; 4:Unsure about use; 5:Does not intend; 6 Never had sex; 9 Missing value)
+
+#Let's harmonize these terms
+dhs <- dhs %>%
+  mutate(
+    v362 = if_else(is.na(v362), NA_character_, as.character(v362) %>% str_squish() %>% tolower()),
+    v362_harmon = case_when(
+      is.na(v362) ~ NA_character_,
+      v362 %in% c("9") ~ NA_character_,
+      v362 %in% c("use later", "2")           ~ "use later",
+      v362 %in% c("unsure about use", "4")    ~ "unsure about use",
+      v362 %in% c("does not intend", "5")     ~ "does not intend",
+      v362 %in% c("never had sex", "6")       ~ "never had sex",
+      TRUE                                    ~ v362
+    )
+  )
+
+# check harmonized values
+dplyr::count(dhs, v362_harmon) #it worked!
+
+#Decision-making about use/non-use
+dplyr::count(dhs, v632, v632a) #11 responses, some numeric & some text. Per recode manuals can relabel numeric values except #4: https://www.dhsprogram.com/pubs/pdf/DHSG4/Recode5Map_2March2012.pdf
+
+#Let's harmonize these terms & combine this data into one new variable
+dhs <- dhs %>%
+  mutate(
+    v632a = if_else(is.na(v632a), NA_character_, as.character(v632a) %>% str_squish() %>% tolower()),
+    v632a_code = case_when(
+      v632a %in% c("mainly respondent")            ~ "1",
+      v632a %in% c("mainly husband, partner")     ~ "2",
+      v632a %in% c("joint decision")               ~ "3",
+      v632a %in% c("other")                        ~ "6",
+      v632a %in% c("9", "9.0")                     ~ NA_character_,
+      v632 %in% c(1,2,3,6)                         ~ as.character(v632),  # catch numeric v632 too
+      TRUE                                        ~ NA_character_
+    ),
+    v632_chr = if_else(is.na(v632), NA_character_, as.character(v632)),
+    v632_632a_harmon = case_when(
+      !is.na(v632_chr) & v632_chr %in% c("1","2","3","6") ~ v632_chr,
+      is.na(v632_chr) & !is.na(v632a_code)               ~ v632a_code,
+      TRUE                                               ~ NA_character_
+    )
+  ) %>%
+  select(-v632a_code, -v632_chr)
+
+dhs <- dhs %>%
+  mutate(
+    v632_632a_harmon = case_when(
+      v632_632a_harmon == "1" ~ "mainly respondent",
+      v632_632a_harmon == "2" ~ "mainly husband, partner",
+      v632_632a_harmon == "3" ~ "joint decision",
+      v632_632a_harmon == "6" ~ "other",
+      TRUE                    ~ NA_character_
+    )
+  )
+
+# check harmonized values
+dplyr::count(dhs, v632_632a_harmon) #it worked!
+
+#check CaseID
+dplyr::count(dhs, caseid) #583,091 unique responses with 8,911 NAs
+
+#check Row of month of interview 
+dplyr::count(dhs, v018) #21 rows with 40,482 NAs
+
+#check sample domain 
+dplyr::count(dhs, v023) #69 rows with 30,325 NAs
+
+
+##Issues with data missingness for v023, need to add some variables & then this string of code per DHS
+#OK having issues with missingness in v023. Survey Strata file to generate strata for each survey downloaded from here (from DHS Research & Data Analysis Director, Tom Pullum): https://userforum.dhsprogram.com/index.php?t=msg&goto=13398&
+do_path <- "Survey_strata.do"
+do_lines <- readLines(do_path, warn = FALSE)
+head(do_lines, 50)
+
+lines <- readLines("Survey_strata.do", warn = FALSE)
+# look for use, infile, import delimited, or restore commands
+data_calls <- lines[str_detect(lines, regex("\\b(use|infile|import delimited|restore)\\b", ignore_case = TRUE))]
+data_calls
+
+###Based on the Advice from the DHS
+# create phase/year
+dhs <- dhs %>%
+  mutate(
+    phase = v000,
+    year  = v007
+  )
+
+# create grouped strata equivalents
+dhs <- dhs %>%
+  mutate(
+    strata_v023 = case_when(
+      !is.na(v023) & !is.na(v025)  ~ paste0("g23_", v023, "_", v025),
+      TRUE ~ NA_character_
+    ),
+    strata_v024 = case_when(
+      !is.na(v024) & !is.na(v025)  ~ paste0("g24_", v024, "_", v025),
+      TRUE ~ NA_character_
+    )
+  )
+
+# initial strata preference
+dhs <- dhs %>%
+  mutate(
+    strata = coalesce(as.character(v022), strata_v023, strata_v024, country_code)
+  )
+
+
+# keep only exceptions relevant to CO, EG, ID, RW, ZW
+exc_v023 <- c("CO2","CO3","EG2","EG3","EG4","ID2","ID3","ID4","ID5","RW2","RW4","RW6","ZW","ZW3","ZW4","ZW5")
+exc_v024 <- c("CO2","CO3","EG3","EG4","ID4","ID5","RW2","RW4","RW6","ZW","ZW3","ZW4","ZW5")
+exc_v023_alt <- c()  # none relevant
+
+# apply exceptions:
+# for exc_v023: set strata = v023 (or mv023/hv023/country_code fallback)
+dhs <- dhs %>%
+  mutate(
+    strata = if_else(phase %in% exc_v023,
+                     coalesce(as.character(v023), country_code),
+                     strata)
+  )
+
+# for exc_v024: set strata = strata_v024 where available
+dhs <- dhs %>%
+  mutate(
+    strata = if_else(phase %in% exc_v024,
+                     coalesce(strata_v024, strata),
+                     strata)
+  )
+
+# convert strata to integer factor ids
+dhs <- dhs %>% mutate(strata = as.integer(factor(strata)))
+
+############################# DHS CPR growth analysis ###################################
+############################# Michelle's Code ###################################
+
+#source(dhs_data_extraction.R)
+
+table(dhs$v302_harmon)
+
+dhs$ever_FP <- NA
+dhs$ever_FP[dhs$v302_harmon == "never used"] <- "never used"
+dhs$ever_FP[dhs$v302_harmon == "used only folkloric" | dhs$v302_harmon == "used only folkloric method" |
+              dhs$v302_harmon == "used only trad. meth" | dhs$v302_harmon == "used only traditional method" |
+              dhs$v302_harmon == "used any method"] <- "used folk/trad method"
+dhs$ever_FP[dhs$v302_harmon == "used modern method"] <- "used modern method"
+
+
+dhs$ever_FP_v2 <- NA
+dhs$ever_FP_v2[dhs$v302a == 0 | 
+                 dhs$v302a == "no"] <- "Never used"
+dhs$ever_FP_v2[dhs$v302a == 1 | 
+                 dhs$v302a == "yes" |
+                 dhs$v302a == "yes, currently use" |
+                 dhs$v302a == "yes, no calendar data" |
+                 dhs$v302a == "yes, used in calendar" |
+                 dhs$v302a == "yes, used in the past" | 
+                 dhs$v302a == "yes, used outside calendar"] <- "Ever used any method"
+
+dhs$ever_FP_v3 <- NA
+dhs$ever_FP_v3[dhs$v302a == 0 | 
+                 dhs$v302a == "no" | 
+                 dhs$v302_harmon == "never used"] <- "Never used"
+dhs$ever_FP_v3[dhs$v302a == 1 | 
+                 dhs$v302a == "yes" |
+                 dhs$v302a == "yes, currently use" |
+                 dhs$v302a == "yes, no calendar data" |
+                 dhs$v302a == "yes, used in calendar" |
+                 dhs$v302a == "yes, used in the past" | 
+                 dhs$v302a == "yes, used outside calendar" |
+                 dhs$v302_harmon == "used only folkloric" | 
+                 dhs$v302_harmon == "used only folkloric method" |
+                 dhs$v302_harmon == "used only trad. meth" | 
+                 dhs$v302_harmon == "used only traditional method" |
+                 dhs$v302_harmon == "used any method" |
+                 dhs$v302_harmon == "used modern method"
+] <- "Ever used any method"
+table(dhs$v000, dhs$ever_FP_v3)
+
+######Let's Create a Timeline of Approximately When each Method was available in Each Country #######
+##We'll add in a new data frame for this
+
+#load in the timeline data (from rapid review)
+df <- read.csv("~/Dropbox/DHS_Data/Contraceptive_Transitions/Timeline.csv", header=TRUE) 
+
+library(RColorBrewer)
+palette <- colorRampPalette(brewer.pal(8, "BrBG"))(length(methods))
+
+df_long <- df %>%
+  pivot_longer(-Contraceptive.Method, names_to = "country", values_to = "year")
+
+start_bound <- min(df_long$year)
+end_bound   <- 2025
+
+countries <- unique(df_long$country)
+methods   <- unique(df_long$Contraceptive.Method)
+country_y <- tibble(country = countries, y_base = seq_along(countries))
+offsets <- tibble(Contraceptive.Method = methods,
+                  y_offset = seq(0, by = 0.08, length.out = length(methods)) - mean(seq(0, by = 0.08, length.out = length(methods))))
+
+segments_df <- df_long %>%
+  left_join(country_y, by = "country") %>%
+  left_join(offsets, by = "Contraceptive.Method") %>%
+  mutate(seg_start = as.Date(paste0(year, "-01-01")),
+         seg_end   = as.Date(paste0(end_bound, "-01-01")),
+         y = y_base + y_offset) %>%
+  select(Contraceptive.Method, country, seg_start, seg_end, y)
+
+# handle Zimbabwe injections gap: 1969-1981 and 1992-end
+segments_df <- segments_df %>%
+  filter(!(Contraceptive.Method == "injections" & country == "Zimbabwe")) %>%
+  bind_rows(
+    tibble(Contraceptive.Method = "injections", country = "Zimbabwe",
+           seg_start = as.Date("1969-01-01"), seg_end = as.Date("1981-01-01")) %>%
+      left_join(country_y, by = "country") %>% left_join(offsets, by = "Contraceptive.Method") %>%
+      mutate(y = y_base + y_offset) %>% select(Contraceptive.Method, country, seg_start, seg_end, y),
+    tibble(Contraceptive.Method = "injections", country = "Zimbabwe",
+           seg_start = as.Date("1992-01-01"), seg_end = as.Date(paste0(end_bound, "-01-01"))) %>%
+      left_join(country_y, by = "country") %>% left_join(offsets, by = "Contraceptive.Method") %>%
+      mutate(y = y_base + y_offset) %>% select(Contraceptive.Method, country, seg_start, seg_end, y)
+  )
+
+segments_df$Contraceptive.Method <- factor(segments_df$Contraceptive.Method, levels = methods)
+segments_df$country <- factor(segments_df$country, levels = countries)
+
+palette <- colorRampPalette(brewer.pal(8, "BrBG"))(length(methods)) #this gives too light of a color for injections
+
+# build palette and override injections with darker mint green
+base_pal <- colorRampPalette(brewer.pal(8, "BrBG"))(length(methods))
+named_pal <- set_names(base_pal, methods)
+named_pal["injections"] <- "#2F9B83"  # darker mint green
+
+# plot with the named palette
+ggplot(segments_df) +
+  geom_segment(aes(x = seg_start, xend = seg_end, y = y, yend = y, color = Contraceptive.Method),
+               size = 1.5, lineend = "butt") +
+  scale_y_continuous(breaks = country_y$y_base, labels = country_y$country, expand = expansion(add = 0.4)) +
+  scale_x_date(date_breaks = "5 years", date_labels = "%Y",
+               limits = c(as.Date(paste0(start_bound, "-01-01")), as.Date(paste0(end_bound, "-12-31")))) +
+  scale_color_manual(values = named_pal) +
+  labs(x = "Year", y = NULL, color = "Method", title = "Modern Contraceptive Availability by Country and Method") +
+  theme_minimal() +
+  theme(panel.grid.minor = element_blank(),
+        legend.position = "right",
+        axis.text.y = element_text(size = 11),
+        plot.title = element_text(size = 13, face = "bold"))
+
+#Save a pdf
+ggsave("contraceptive_timeline.pdf", width = 10, height = 6, units = "in", device = "pdf")
+
+
+################## Calculating mCPR, for the methods of interest, in countries of interest using calendar data##################
+######## Will explore both among married & all women, as historical surveys may not have all women ##########
+
+#Adapted from IPUMS: https://dhsprogram.com/data/Calendar-Tutorial/index.cfm#programsexamples ; https://dhsprogram.com/data/Calendar-Tutorial/index.cfm#programsexamples
+
+#Variables that matter:
+#caseid vcal_1 v000 v005 v007 v008 v011 v018 v021 v023 from IR datasets
+#Limited to methods of interest (3- IUD, 4-Injectable, 5-Implants, 6-Pill) per: https://www.dhsprogram.com/data/calendar-tutorial/upload/DHS-Contraceptive-Calendar-Tutorial.pdf
+
+library(survey)
+if ("package:plyr" %in% search()) detach("package:plyr", unload = TRUE)
+library(dplyr); library(tidyr); library(stringr); library(purrr)
+
+vars_keep <- c("caseid","vcal_1","v000", "v001", "v005","v007_fixed","v008","v011","v018","v021_fixed","strata","country_code")
+dhs2 <- dhs %>% select(any_of(vars_keep))
+
+# Modify vcal_1 to character and pad with spaces
+dhs2 <- dhs2 %>%
+  mutate(vcal_1 = as.character(vcal_1),
+         vcal_1 = str_pad(vcal_1, width = 80, side = "right", pad = " "))
+
+# Transform data to long format
+dhs_long <- dhs2 %>%
+  mutate(row_id = row_number(),
+         chars = str_split(vcal_1, pattern = "", simplify = FALSE)) %>%
+  mutate(chars = map(chars, ~ .x[.x != ""])) %>%
+  mutate(chars = map(chars, ~ {
+    vec <- .x
+    if (length(vec) < 80) vec <- c(vec, rep(" ", 80 - length(vec)))
+    vec[1:80]
+  })) %>%
+  unnest_longer(chars) %>%
+  group_by(row_id) %>%
+  mutate(month = row_number()) %>%
+  ungroup() %>%
+  rename(method = chars) %>%
+  mutate(method = na_if(str_trim(method), "")) %>%
+  select(caseid, month, method, v000, v001, v005, v007_fixed, v008, v011, v018, v021_fixed, strata, country_code)
+
+# result: dhs_long (one row per caseid-month, months 1..80)
+dhs_long #initial printout shows only NA in the method column
+
+#A quick check to make sure that there are other variables here apart from NA
+sum(!is.na(dhs_long$method)) #YUP, looks OK
+
+# Step 6.3: compute maximum v018 per country (earliest date of interview as in Stata: max(v018))
+dhs_final <- dhs_long %>%
+  group_by(country_code) %>%
+  mutate(v018_max = max(v018, na.rm = TRUE)) %>%
+  filter(month >= v018_max & month <= (v018_max + 59)) %>%
+  mutate(
+    agem = (v008 - v011) - (month - v018),
+    cmctime = v008 - (month - v018)
+  ) %>%
+  ungroup()
+
+# Create using any as 0/100 numeric (0 = Not using, 100 = Using). Change from IPUMS code to only focus on methods of interest
+dhs_final <- dhs_final %>%
+  mutate(usingany = if_else(method %in% c("3", "4", "5", "6") & !is.na(method), 100, 0))
+
+# Create weight
+dhs_final <- dhs_final %>%
+  mutate(wt = v005 / 1e6)
+
+# Reduced dataset for tabulation and survey design
+dhs_small <- dhs_final %>%
+  select(cmctime, agem, wt, usingany) %>%
+  filter(!is.na(agem))
+
+#Tabulate
+cpr_by_cmctime <- dhs_small %>%
+  filter(between(agem, 180, 539)) %>%
+  group_by(cmctime) %>%
+  summarise(
+    total_wt = sum(wt, na.rm = TRUE),
+    wt_using = sum(wt * (usingany == 100), na.rm = TRUE),
+    pct_using = 100 * wt_using / total_wt,
+    .groups = "drop"
+  ) %>%
+  arrange(cmctime)
+
+cpr_by_cmctime %>% select(cmctime, pct_using)
+
+# Full tabulation with using flag
+cpr_full <- dhs_small %>%
+  filter(between(agem, 180, 539)) %>%
+  mutate(using_flag = if_else(usingany == 100, "Using", "Not using")) %>%
+  group_by(cmctime, using_flag) %>%
+  summarise(w = sum(wt, na.rm = TRUE), .groups = "drop") %>%
+  group_by(cmctime) %>%
+  mutate(row_total = sum(w),
+         row_pct = 100 * w / row_total) %>%
+  ungroup()
+
+# Wide printed table: columns for Not using / Using showing weighted totals and row percentages (again reminder that just for methods of interest)
+cpr_wide <- cpr_full %>%
+  select(cmctime, using_flag, w, row_pct) %>%
+  pivot_wider(names_from = using_flag,
+              values_from = c(w, row_pct),
+              names_sep = "_") %>%
+  arrange(cmctime)
+
+print(cpr_wide)
+
+# Ensure dhs_final has the required columns: v021_fixed, wt, and strata. Disaggregated by Country due to memory issues
+dhs_design_dat <- dhs_final %>%
+  select(v021_fixed, strata, wt, agem, usingany, country_code) %>%
+  filter(!is.na(v021_fixed) & !is.na(strata) & !is.na(wt) & !is.na(usingany))
+dhs_design <- survey::svydesign(ids=~v021_fixed, strata=~strata, weights=~wt, data=dhs_design_dat, nest=TRUE)
+
+# Ensure design dataframe is as small as possible but includes relevant variables
+dhs_design_dat_small <- dhs_final %>%
+  select(v021_fixed, strata, wt, agem, usingany, cmctime, country_code) %>%
+  filter(!is.na(v021_fixed) & !is.na(strata) & !is.na(wt) & !is.na(usingany)) %>%
+  mutate(v021_fixed = as.character(v021_fixed),
+         strata = as.character(strata))
+
+
+# Build design from the filtered small data (preferred)
+dhs_design <- svydesign(
+  ids = ~v021_fixed,
+  strata = ~strata,
+  weights = ~wt,
+  data = dhs_design_dat,  # or dhs_design_dat if you need all ages
+  nest = TRUE
+)
+
+#subset to preserve data
+dhs_sub <- subset(dhs_design, between(agem, 180, 539))
+
+# Calculate the mean of using any (of methods of interest) to get CPR from the subset
+cpr_mean <- svymean(~usingany, dhs_sub, na.rm = TRUE)
+
+# Print the result
+print(cpr_mean)
+
+#compute mean(usingany) by cmctime by country
+res_country <- svyby(~usingany, ~country_code, dhs_sub, svymean, vartype = c("se","ci"))
+
+#by country x cmctime
+countries <- unique(dhs_design_dat_small$country_code)
+res_list <- lapply(countries, function(cc) {
+  dcc <- subset(dhs_sub, country_code == cc)
+  df <- tryCatch(as.data.frame(svyby(~usingany, ~cmctime, dcc, svymean, vartype = c("se","ci"))),
+                 error = function(e) NULL)
+  if (!is.null(df)) df$country_code <- cc
+  df
+})
+res_by_country_cmctime <- bind_rows(res_list)
+
+
+#Let's make a plot
+res_plot <- res_by_country_cmctime %>%
+  as.data.frame() %>%
+  rename(
+    mean_using = usingany,
+    se = se,
+    ci_lower = ci_l,
+    ci_upper = ci_u
+  ) %>%
+  mutate(
+    country_code = as.factor(country_code),
+    cmctime = as.integer(cmctime),
+    year = 1900 + floor((cmctime - 1) / 12)
+  )
+
+library(ggplot2)
+library(dplyr)
+
+plots <- lapply(levels(res_plot$country_code), function(cc) {
+  df <- filter(res_plot, country_code == cc)
+  
+  # choose cmctime breaks (every N points) to avoid crowding
+  cmc_vals <- sort(unique(df$cmctime))
+  step <- max(1, floor(length(cmc_vals) / 10))   # ~10 ticks
+  breaks_cmc <- cmc_vals[seq(1, length(cmc_vals), by = step)]
+  labels_year <- 1900 + floor((breaks_cmc - 1) / 12)
+  
+  ggplot(df, aes(x = cmctime, y = mean_using)) +
+    geom_ribbon(aes(ymin = ci_lower, ymax = ci_upper), fill = "grey80", alpha = 0.6) +
+    geom_line(color = "#1f78b4", size = 0.8) +
+    geom_point(size = 1.2, color = "#1f78b4") +
+    scale_x_continuous(breaks = breaks_cmc, labels = labels_year) +
+    labs(
+      title = paste0("mCPR (methods of interest) over time — country: ", cc),
+      x = "Year",
+      y = "mCPR (%)",
+      caption = "*methods of interest: pill, injectables, implants, IUDs, & emergency contraception"
+    ) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1),
+          panel.background = element_rect(fill = "white", color = NA),
+          plot.background = element_rect(fill = "white", color = NA),
+          plot.caption = element_text(hjust = 0, size = rel(0.8))
+    )
+})
+
+names(plots) <- levels(res_plot$country_code)
+
+print(plots[[1]])
+
+for (cc in names(plots)) {
+  ggsave(paste0("cpr_year_relabel_", cc, ".png"), plot = plots[[cc]], width = 8, height = 4.5, dpi = 300)
+}
+
