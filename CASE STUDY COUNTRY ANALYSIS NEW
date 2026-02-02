@@ -1,0 +1,1404 @@
+################################################################################
+#################    EXPLORING CONTRACEPTIVE TRANSITIONS    ####################
+################################################################################
+
+# CASE STUDY COUNTRY ANALYSIS NEW
+# Prepared by Ana Krause
+# Created in January 2025
+# Resources: DHS Git Hub Family Planning Code & ChatGPT 5.2 to translate STATA code & correct bugs
+
+############################# INITIAL SESSION SET UP ###################################
+
+rm(list=ls()) ##clean environment
+dir <- "~/Dropbox/DHS_Data/DHS"
+
+#Note: drawing from the relevant women's datasets (IR) (as defined under code description: https://dhsprogram.com/data/File-Types-and-Names.cfm)
+
+# =====================================================================
+# DHS MULTI-COUNTRY FAMILY PLANNING INDICATORS (BEST VERSION)
+# =====================================================================
+
+library(haven)
+library(dplyr)
+library(labelled)
+library(data.table)
+library(ggplot2)
+library(tidyr)
+library(scales)
+library(stringr)
+library(purrr)
+library(broom)
+library(sandwich)
+
+# ---------------------------------------------------------------------
+# 0.1 IF DHS CSV already created, load it instead of unzipping again
+# ---------------------------------------------------------------------
+
+dhs <- read.csv("~/Dropbox/DHS_Data/DHS/Trends/dhs_trend.csv", header=TRUE) 
+back_up_dt <- dhs
+
+# Extract survey year from harmonized CMC [web:2][web:4]
+dhs$survey_year <- 1900 + floor((dhs$v008 - 1) / 12)
+
+
+# ---------------------------------------------------------------------
+# 0.2 SUBSET DATA TO 6 CASE STUDY COUNTRIES
+# ---------------------------------------------------------------------
+
+#Let's focus on Senegal, Peru, Zimbabwe, Rwanda, Egypt, & Colombia
+case_prefixes <- c("SN", "PE", "EG", "ZW", "RW", "CO")
+
+#Remove SN5 which was a malaria survey
+dhs_subset <- dhs %>% 
+  mutate(
+    w = v005 / 1e6,                            
+    survey_year = floor((v008 - 1) / 12) + 1900,
+    country_code = substr(v000, 1, 2)
+  ) %>% 
+  filter(
+    country_code %in% case_prefixes,
+    v000 != "SN5"
+  )
+
+# ---------------------------------------------------------------------
+# 1. EVER USE INDICATORS (adapted from DHS Github: https://github.com/DHSProgram/DHS-Indicators-Stata/blob/master/Chap07_FP/FP_USE.do)
+# ---------------------------------------------------------------------
+dhs_subset <- dhs_subset  %>%
+  mutate(
+    # Ever use any method
+    fp_evuse_any  = as.numeric(v302 > 0 & v302 < 8),
+    
+    # Ever use modern method  
+    fp_evuse_mod  = as.numeric(v302 == 3),
+    
+    # Individual modern methods
+    fp_evuse_fster = as.numeric(v305_06 > 0 & v305_06 < 8),
+    fp_evuse_mster = as.numeric(v305_07 > 0 & v305_07 < 8),
+    fp_evuse_pill  = as.numeric(v305_01 > 0 & v305_01 < 8),
+    fp_evuse_iud   = as.numeric(v305_02 > 0 & v305_02 < 8),
+    fp_evuse_inj   = as.numeric(v305_03 > 0 & v305_03 < 8),
+    fp_evuse_imp   = as.numeric(v305_11 > 0 & v305_11 < 8),
+    fp_evuse_mcond = as.numeric(v305_05 > 0 & v305_05 < 8),
+    fp_evuse_fcond = as.numeric(v305_14 > 0 & v305_14 < 8),
+    fp_evuse_diaph = as.numeric(v305_04 > 0 & v305_04 < 8),
+    fp_evuse_sdm   = as.numeric(v305_18 > 0 & v305_18 < 8),
+    fp_evuse_lam   = as.numeric(v305_13 > 0 & v305_13 < 8),
+    fp_evuse_ec    = as.numeric(v305_16 > 0 & v305_16 < 8),
+    fp_evuse_omod  = as.numeric(v305_17 > 0 & v305_17 < 8),
+    
+    # Traditional methods
+    fp_evuse_rhy   = as.numeric(v305_08 > 0 & v305_08 < 8),
+    fp_evuse_wthd  = as.numeric(v305_09 > 0 & v305_09 < 8),
+    fp_evuse_other = as.numeric(v305_10 > 0 & v305_10 < 8),
+    fp_evuse_trad  = as.numeric(fp_evuse_rhy == 1 | fp_evuse_wthd == 1 | fp_evuse_other == 1)
+  )
+
+
+# ---------------------------------------------------------------------
+# 2. CURRENT USE INDICATORS (using v312 numeric codes): note DHS surveys from 1985-1989 used v313=2 to indicate a modern method, but all subsequent recodes (2-7) used v313=3 
+# ---------------------------------------------------------------------
+
+# Note: Per Recode Map, DHS 1 for v313 modern method == 2, whereas for DHS 2-7  v313 modern method == 3
+# Create a new suvery version variable to make these changes
+dhs_subset <- dhs_subset  %>%
+  mutate(
+    v000 = str_trim(as.character(v000)),
+    v000_ver = str_extract(v000, "\\d$") |> as.integer(),
+    v000_ver = if_else(is.na(v000_ver), 1L, v000_ver),
+    
+    fp_cruse_mod = case_when(
+      v000_ver == 1L ~ as.numeric(v313 == 2),
+      v000_ver >= 2L ~ as.numeric(v313 == 3),
+      TRUE ~ NA_real_
+    )
+  )
+
+# Let's apply a v313 modern-method rule based on this recode logic
+dhs_subset <- dhs_subset %>%
+  mutate(
+    v000 = str_trim(as.character(v000)),
+    v000_ver = as.integer(str_extract(v000, "\\d$")),
+    v000_ver = dplyr::coalesce(v000_ver, 1L),
+    
+    fp_cruse_mod = if_else(
+      v000_ver == 1L,
+      as.numeric(v313 == 2),
+      as.numeric(v313 == 3)   # applies to 2–7 (and anything else with a digit)
+    )
+  )
+
+#Create weight & specify denominator
+dhs_subset <- dhs_subset %>%
+  mutate(
+    w = v005 / 1e6,
+    mcpr_denom = !is.na(fp_cruse_mod)
+  )
+
+# ---------------------------------------------------------------------
+#3. CASE STUDIES: mCPR TREND (all modern methods) by Survey & for 4 Methods of interest
+# ---------------------------------------------------------------------
+# Survey Level mCPR (all modern methods)
+mcpr_survey <- dhs_subset %>%
+  mutate(
+    survey_year = 1900 + floor((v008 - 1) / 12)
+  ) %>%
+  group_by(v000, survey_year) %>%
+  summarise(
+    N_women = sum(w[mcpr_denom], na.rm = TRUE),
+    mCPR = weighted.mean(
+      fp_cruse_mod[mcpr_denom],
+      w[mcpr_denom],
+      na.rm = TRUE
+    ) * 100,
+    .groups = "drop"
+  )
+
+print(mcpr_survey)
+
+# Now mCPR for JUST the 4 Methods (IUD, Pill, Implants, Injectables)
+dhs_subset <- dhs_subset %>%
+  mutate(
+    w = v005 / 1e6,
+    survey_year = 1900 + floor((v008 - 1) / 12),
+    
+    # Denominator: all women 15–49 with valid current method info
+    # (v312==0 is valid = non-user; NA means missing)
+    denom_v312 = !is.na(v312) & v012 >= 15 & v012 <= 49,
+    
+    # Basket of 4 modern methods
+    use_4methods = if_else(
+      denom_v312,
+      as.numeric(v312 %in% c(1, 2, 3, 11)),
+      NA_real_
+    )
+  )
+
+mcpr_4m_survey <- dhs_subset %>%
+  group_by(v000, survey_year) %>%
+  summarise(
+    N_women = sum(w[denom_v312], na.rm = TRUE),
+    mCPR_4methods = weighted.mean(
+      use_4methods[denom_v312],
+      w[denom_v312],
+      na.rm = TRUE
+    ) * 100,
+    .groups = "drop"
+  )
+
+
+# mCPR by method
+mcpr_methods_survey <- dhs_subset %>%
+  mutate(
+    pill = if_else(denom_v312, as.numeric(v312 == 1), NA_real_),
+    iud  = if_else(denom_v312, as.numeric(v312 == 2), NA_real_),
+    inj  = if_else(denom_v312, as.numeric(v312 == 3), NA_real_),
+    imp  = if_else(denom_v312, as.numeric(v312 == 11), NA_real_)
+  ) %>%
+  group_by(v000, survey_year) %>%
+  summarise(
+    N_women = sum(w[denom_v312], na.rm = TRUE),
+    mCPR_pill = weighted.mean(pill[denom_v312], w[denom_v312], na.rm = TRUE) * 100,
+    mCPR_iud  = weighted.mean(iud[denom_v312],  w[denom_v312], na.rm = TRUE) * 100,
+    mCPR_inj  = weighted.mean(inj[denom_v312],  w[denom_v312], na.rm = TRUE) * 100,
+    mCPR_imp  = weighted.mean(imp[denom_v312],  w[denom_v312], na.rm = TRUE) * 100,
+    mCPR_4methods = weighted.mean(use_4methods[denom_v312], w[denom_v312], na.rm = TRUE) * 100,
+    .groups = "drop"
+  )
+
+# ---------------------------------------------------------------------
+#4. PLOTS OF CASE STUDIES: mCPR TREND (all modern methods) by Survey & for 4 Methods of interest
+# ---------------------------------------------------------------------
+# All modern mCPR (from mcpr_survey)
+mcpr_all <- mcpr_survey %>%
+  mutate(country_code = substr(v000, 1, 2)) %>%
+  filter(!is.na(mCPR))
+
+# 4-method + method-specific (from mcpr_methods_survey)
+mcpr_4m <- mcpr_methods_survey %>%
+  mutate(country_code = substr(v000, 1, 2)) %>%
+  filter(!is.na(mCPR_4methods))
+
+# Plot DF 1
+plot_df1 <- mcpr_all %>%
+  select(country_code, v000, survey_year, mCPR_all_modern = mCPR) %>%
+  left_join(
+    mcpr_4m %>% select(country_code, v000, survey_year, mCPR_4methods),
+    by = c("country_code", "v000", "survey_year")
+  ) %>%
+  pivot_longer(
+    cols = c(mCPR_all_modern, mCPR_4methods),
+    names_to = "series",
+    values_to = "value"
+  ) %>%
+  mutate(series = recode(series,
+                         mCPR_all_modern = "All modern mCPR",
+                         mCPR_4methods   = "4-method mCPR")) %>%
+  filter(!is.na(value)) %>%
+  arrange(country_code, series, survey_year)
+
+p1 <- ggplot(plot_df1, aes(x = survey_year, y = value, linetype = series, group = series)) +
+  geom_line() +
+  geom_point(size = 1.5) +
+  facet_wrap(~ country_code, scales = "free_x") +
+  labs(
+    x = "Survey year",
+    y = "Percent (weighted)",
+    linetype = NULL,
+    title = "Modern mCPR vs 4-method mCPR (pill/IUD/injectables/implant)",
+    subtitle = "Survey-level weighted estimates among all women 15–49"
+  ) +
+  scale_y_continuous(limits = c(0, 100)) +
+  theme_minimal()
+
+p1
+ggsave("mCPR_trend_modern_4method.png", p1, width = 16, height = 8, dpi = 300)
+
+
+#PLOT 2: 4-mthod mCPR vs. method specific mCPR in each country
+plot_df2 <- mcpr_4m %>%
+  select(
+    country_code, v000, survey_year,
+    mCPR_4methods,
+    mCPR_pill, mCPR_iud, mCPR_imp, mCPR_inj
+  ) %>%
+  pivot_longer(
+    cols = c(mCPR_4methods, mCPR_pill, mCPR_iud, mCPR_imp, mCPR_inj),
+    names_to = "series",
+    values_to = "value"
+  ) %>%
+  mutate(
+    series = recode(series,
+                    mCPR_4methods = "4-method mCPR",
+                    mCPR_pill     = "Pill",
+                    mCPR_iud      = "IUD",
+                    mCPR_imp      = "Implant",
+                    mCPR_inj      = "Injectables"
+    )
+  )
+
+plot_df2_clean <- plot_df2 %>%
+  filter(!is.na(value)) %>%
+  arrange(country_code, series, survey_year) %>%
+  mutate(line_w = if_else(series == "4-method mCPR", 1.4, 0.7))
+
+p2 <- ggplot(
+  plot_df2_clean,
+  aes(
+    x = survey_year,
+    y = value,
+    color = series,
+    group = series
+  )
+) +
+  geom_line(aes(linewidth = line_w)) +
+  geom_point(size = 1.6) +
+  facet_wrap(~ country_code, scales = "free_x") +
+  scale_linewidth_identity() +
+  scale_y_continuous(limits = c(0, 100)) +
+  labs(
+    x = "Survey year",
+    y = "Percent (weighted)",
+    color = NULL,
+    title = "4-method mCPR and method-specific mCPR",
+    subtitle = "Pill, IUD, Injectables, Implant — survey-level weighted estimates"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    panel.grid.minor = element_blank()
+  )
+
+p2
+ggsave("mCPR_trend_4methods.png", p2, width = 16, height = 8, dpi = 300)
+
+
+# ---------------------------------------------------------------------
+#5.  CASE STUDIES: mCPR TREND (all modern methods) by Survey & for 4 Methods of interest
+# ---------------------------------------------------------------------
+## Note Rwanda can have urban-rural covariate as no missingness, as 1st survey was version 2. 
+#Unfortunately v025 not a variable in 1st round of DHS so missing from other countries per the following
+dplyr::count(dhs_subset, v025) 
+survey_missingness <- dhs_subset %>% 
+group_by(v000) %>% 
+summarise(total_rows = n(),
+n_NAs_v025 = sum(is.na(v025)),
+pct_NAs = round((n_NAs_v025 / total_rows) * 100, 1),.groups = "drop") %>% 
+filter(pct_NAs == 100) %>% 
+pull(v000)
+print(survey_missingness)
+
+# ---------------------------------------------------------------------
+#6.  NEW CASE STUDIES: mCPR TREND (all modern methods) by Survey & for 4 Methods of interest
+# MODEL 1
+# ---------------------------------------------------------------------
+
+#STEP 0: Set-up
+mcpr_methods_survey <- dhs_subset %>%
+  mutate(
+    country_code = substr(v000, 1, 2),   # <-- ADD THIS
+    pill = if_else(denom_v312, as.numeric(v312 == 1), NA_real_),
+    iud  = if_else(denom_v312, as.numeric(v312 == 2), NA_real_),
+    inj  = if_else(denom_v312, as.numeric(v312 == 3), NA_real_),
+    imp  = if_else(denom_v312, as.numeric(v312 == 11), NA_real_)
+  ) %>%
+  group_by(v000, country_code, survey_year) %>%  
+  summarise(
+    N_women = sum(w[denom_v312], na.rm = TRUE),
+    mCPR_pill = weighted.mean(pill[denom_v312], w[denom_v312], na.rm = TRUE) * 100,
+    mCPR_iud  = weighted.mean(iud[denom_v312],  w[denom_v312], na.rm = TRUE) * 100,
+    mCPR_inj  = weighted.mean(inj[denom_v312],  w[denom_v312], na.rm = TRUE) * 100,
+    mCPR_imp  = weighted.mean(imp[denom_v312],  w[denom_v312], na.rm = TRUE) * 100,
+    mCPR_4methods = weighted.mean(use_4methods[denom_v312], w[denom_v312], na.rm = TRUE) * 100,
+    .groups = "drop"
+  )
+
+
+#STEP 1: Build survey-level covariates (once)
+survey_covs <- dhs_subset %>%
+  filter(v012 >= 15 & v012 <= 49) %>%
+  group_by(v000, country_code, survey_year) %>%
+  summarise(
+    pct_under30 = weighted.mean(v012 <= 29, w, na.rm = TRUE) * 100,
+    pct_primary = weighted.mean(v106 == 1, w, na.rm = TRUE) * 100,
+    pct_secplus = weighted.mean(v106 %in% c(2,3), w, na.rm = TRUE) * 100,
+    .groups = "drop"
+  )
+
+#STEP 2: Combine outcomes into ONE long dataset
+mcpr_long <- mcpr_methods_survey %>%
+  left_join(survey_covs, by = c("v000", "country_code", "survey_year")) %>%
+  group_by(country_code) %>%
+  mutate(
+    time = survey_year - min(survey_year, na.rm = TRUE),
+    pct_under30_c = pct_under30 - mean(pct_under30, na.rm = TRUE),
+    pct_primary_c = pct_primary - mean(pct_primary, na.rm = TRUE),
+    pct_secplus_c = pct_secplus - mean(pct_secplus, na.rm = TRUE)
+  ) %>%
+  ungroup() %>%
+  pivot_longer(
+    cols = c(mCPR_4methods, mCPR_pill, mCPR_iud, mCPR_inj, mCPR_imp),
+    names_to = "outcome",
+    values_to = "mCPR"
+  ) %>%
+  mutate(p = mCPR / 100) %>%
+  filter(!is.na(p), N_women > 0)
+
+#STEP 3: Fit the model you specified (per country × outcome)
+fit_one <- function(df) {
+  glm(
+    p ~ time + pct_under30_c + pct_primary_c + pct_secplus_c,
+    family = quasibinomial(),
+    weights = N_women,
+    data = df
+  )
+}
+
+#Run all models
+models <- mcpr_long %>%
+  group_by(country_code, outcome) %>%
+  group_map(~ fit_one(.x), .keep = TRUE)
+
+#Create a key Table
+model_keys <- mcpr_long %>%
+  distinct(country_code, outcome) %>%
+  arrange(country_code, outcome)
+
+#STEP 4: Robust SEs + CIs
+library(broom)
+library(sandwich)
+
+tidy_robust <- function(mod) {
+  td <- broom::tidy(mod)
+  V  <- sandwich::vcovHC(mod, type = "HC1")
+  se <- sqrt(diag(V))
+  
+  td$std.error <- se[match(td$term, names(se))]
+  td$statistic <- td$estimate / td$std.error
+  td$p.value   <- 2 * pnorm(abs(td$statistic), lower.tail = FALSE)
+  
+  td
+}
+
+results <- purrr::map2_df(
+  models,
+  split(model_keys, seq_len(nrow(model_keys))),
+  ~ tidy_robust(.x) %>%
+    mutate(country_code = .y$country_code,
+           outcome = .y$outcome)
+)
+
+# STEP 5: Interpretability helpers (optional but recommended)
+results <- results %>%
+  mutate(
+    OR = exp(estimate),
+    OR_low = exp(estimate - 1.96 * std.error),
+    OR_high = exp(estimate + 1.96 * std.error)
+  )
+
+# Time slopes
+time_slopes <- results %>%
+  filter(term == "time") %>%
+  arrange(country_code, outcome)
+
+#RESULTS
+country_time_summary <- results %>%
+  filter(term == "time") %>%
+  mutate(
+    outcome = recode(outcome,
+                     mCPR_4methods = "4 methods combined",
+                     mCPR_pill = "Pill",
+                     mCPR_iud  = "IUD",
+                     mCPR_inj  = "Injectables",
+                     mCPR_imp  = "Implants"
+    ),
+    trend = case_when(
+      OR_low > 1 ~ "Increasing",
+      OR_high < 1 ~ "Decreasing",
+      TRUE ~ "No clear change"
+    )
+  ) %>%
+  select(
+    country_code, outcome,
+    estimate, std.error,
+    OR, OR_low, OR_high,
+    p.value, trend
+  ) %>%
+  arrange(country_code, outcome)
+
+print(country_time_summary)
+
+#3) Add a “full-period change” (more interpretable)
+time_span <- mcpr_long %>%
+  distinct(country_code, survey_year, time) %>%
+  group_by(country_code) %>%
+  summarise(dt = max(time, na.rm = TRUE), .groups = "drop")
+
+#Join and compute period OR:
+country_time_summary2 <- country_time_summary %>%
+  left_join(time_span, by = "country_code") %>%
+  mutate(OR_period = OR^dt)
+
+country_time_summary2 %>%
+  filter(outcome == "4 methods combined") %>%
+  select(country_code, dt, OR, OR_period, OR_low, OR_high, trend) %>%
+  arrange(country_code) %>%
+  print()
+
+#4) Now for each method
+country_method_period_tbl_noperiod <- country_method_period_tbl %>%
+  select(
+    country_code, outcome, dt,
+    OR, OR_low, OR_high,
+    p.value, trend
+  )
+
+
+# Print one table per country
+library(gt)
+
+# -----------------------------
+# 1) TIME-SLOPE SUMMARY TABLES
+# -----------------------------
+tables_by_country <- country_method_period_tbl_noperiod %>%
+  group_split(country_code) %>%
+  setNames(unique(country_method_period_tbl_noperiod$country_code)) %>%
+  purrr::map(~{
+    gt(.x) %>%
+      fmt_number(columns = c(OR, OR_low, OR_high), decimals = 2) %>%
+      fmt_number(columns = p.value, decimals = 3) %>%
+      cols_label(
+        dt      = "Years spanned",
+        OR      = "OR (per year)",
+        OR_low  = "OR low",
+        OR_high = "OR high",
+        p.value = "p",
+        trend   = "Trend"
+      )
+  })
+
+# View
+tables_by_country$CO
+tables_by_country$PE
+tables_by_country$ZW
+tables_by_country$EG
+tables_by_country$RW
+tables_by_country$SN
+
+# -----------------------------------------------------
+# 2) FULL COEFFICIENT TABLES (ROBUST SEs + BASELINE mCPR)
+#    Baseline is taken from the fitted line at first survey
+#    (matches the model-fit plots; avoids plogis(intercept) issues)
+# -----------------------------------------------------
+
+# Extract all coefficients with robust SEs
+tidy_robust_full <- function(mod) {
+  td <- broom::tidy(mod)
+  V  <- sandwich::vcovHC(mod, type = "HC1")
+  se <- sqrt(diag(V))
+  
+  td %>%
+    mutate(
+      std.error = se[match(term, names(se))],
+      statistic = estimate / std.error,
+      p.value   = 2 * pnorm(abs(statistic), lower.tail = FALSE),
+      OR        = exp(estimate),
+      OR_low    = exp(estimate - 1.96 * std.error),
+      OR_high   = exp(estimate + 1.96 * std.error)
+    )
+}
+
+# For all models
+coef_results <- purrr::map2_df(
+  models,
+  split(model_keys, seq_len(nrow(model_keys))),
+  ~ tidy_robust_full(.x) %>%
+    mutate(
+      country_code = .y$country_code,
+      outcome      = .y$outcome
+    )
+)
+
+# Clean, interpretable coefficient table (keep outcome codes for now)
+coef_table <- coef_results %>%
+  mutate(
+    outcome = recode(outcome,
+                     mCPR_4methods = "4 methods combined",
+                     mCPR_pill     = "Pill",
+                     mCPR_iud      = "IUD",
+                     mCPR_inj      = "Injectables",
+                     mCPR_imp      = "Implants"
+    ),
+    term = recode(term,
+                  "(Intercept)"   = "Intercept (baseline)",
+                  "time"          = "Time (per year)",
+                  "pct_under30_c" = "% under 30 (centered)",
+                  "pct_primary_c" = "% primary (centered)",
+                  "pct_secplus_c" = "% secondary+ (centered)"
+    )
+  ) %>%
+  select(
+    country_code, outcome, term,
+    estimate, std.error,
+    OR, OR_low, OR_high,
+    p.value
+  ) %>%
+  arrange(country_code, outcome, term)
+
+print(coef_table, n = 20)
+
+
+# -----------------------------------------------------
+# 2a) BASELINE mCPR FROM FITTED VALUES USED IN THE PLOTS
+#     Requires mcpr_fitted_ci from your plot code:
+#       mcpr_fitted_ci has columns:
+#         country_code, outcome (code), survey_year, mCPR_hat, mCPR_low, mCPR_high
+# -----------------------------------------------------
+
+# Build baseline from the fitted trajectory at the FIRST survey year
+baseline_from_plot <- mcpr_fitted_ci %>%
+  group_by(country_code, outcome) %>%                 # outcome code here (e.g., mCPR_iud)
+  slice_min(survey_year, with_ties = FALSE) %>%
+  ungroup() %>%
+  transmute(
+    country_code,
+    outcome,
+    baseline_year = survey_year,
+    baseline_mCPR = mCPR_hat,
+    baseline_low  = mCPR_low,
+    baseline_high = mCPR_high
+  ) %>%
+  mutate(
+    # convert outcome code -> same labels used in coef_table
+    outcome = recode(outcome,
+                     mCPR_4methods = "4 methods combined",
+                     mCPR_pill     = "Pill",
+                     mCPR_iud      = "IUD",
+                     mCPR_inj      = "Injectables",
+                     mCPR_imp      = "Implants"
+    )
+  )
+
+
+# -----------------------------------------------------
+# 2b) PREP FOR PRETTY TABLE (NO baseline_mCPR_pct ANYWHERE)
+# -----------------------------------------------------
+coef_table_pretty <- coef_table %>%
+  left_join(baseline_from_plot, by = c("country_code", "outcome")) %>%
+  mutate(
+    # only show baseline columns on intercept row
+    baseline_year = if_else(term == "Intercept (baseline)", baseline_year, NA_real_),
+    baseline_mCPR = if_else(term == "Intercept (baseline)", baseline_mCPR, NA_real_),
+    baseline_low  = if_else(term == "Intercept (baseline)", baseline_low,  NA_real_),
+    baseline_high = if_else(term == "Intercept (baseline)", baseline_high, NA_real_),
+    
+    # Order outcomes
+    outcome = factor(
+      outcome,
+      levels = c("4 methods combined", "IUD", "Pill", "Injectables", "Implants")
+    ),
+    # Order terms
+    term = factor(
+      term,
+      levels = c(
+        "Intercept (baseline)",
+        "Time (per year)",
+        "% under 30 (centered)",
+        "% primary (centered)",
+        "% secondary+ (centered)"
+      )
+    )
+  ) %>%
+  arrange(country_code, outcome, term)
+
+
+# -----------------------------------------------------
+# 2c) BUILD PRETTY COEFFICIENT TABLES BY COUNTRY
+# -----------------------------------------------------
+coef_tables_by_country <- coef_table_pretty %>%
+  group_split(country_code) %>%
+  setNames(unique(coef_table_pretty$country_code)) %>%
+  purrr::map(~{
+    gt(.x, groupname_col = "outcome") %>%
+      fmt_number(columns = c(baseline_mCPR, baseline_low, baseline_high), decimals = 1) %>%
+      fmt_number(columns = c(OR, OR_low, OR_high), decimals = 2) %>%
+      fmt_number(columns = p.value, decimals = 3) %>%
+      cols_label(
+        term          = "Covariate",
+        baseline_year = "Baseline year",
+        baseline_mCPR = "Baseline mCPR (%)",
+        baseline_low  = "Baseline low",
+        baseline_high = "Baseline high",
+        OR            = "OR",
+        OR_low        = "OR low",
+        OR_high       = "OR high",
+        p.value       = "p-value"
+      ) %>%
+      cols_hide(columns = c(country_code, estimate, std.error)) %>%
+      tab_header(
+        title = "Model coefficients by method",
+        subtitle = paste("Country:", unique(.x$country_code))
+      ) %>%
+      tab_source_note(
+        source_note = "Baseline mCPR (%) is the model-fitted value at the first survey year (matches the fitted line in the plots). ORs are per-unit effects from quasibinomial logit models with robust SEs."
+      )
+  })
+
+# Add footnote explaining intercept
+coef_tables_by_country <- coef_tables_by_country %>%
+  purrr::map(~ .x %>%
+               tab_footnote(
+                 footnote = "Intercept row shows baseline mCPR at the first survey year using that survey’s covariate values; other rows show covariate effects as ORs.",
+                 locations = cells_column_labels(columns = term)
+               )
+  )
+
+# View
+coef_tables_by_country$CO
+coef_tables_by_country$ZW
+coef_tables_by_country$RW
+coef_tables_by_country$EG
+coef_tables_by_country$SN
+coef_tables_by_country$PE
+
+#Save Table Figures for each country (Colombia example)
+gtsave(
+  coef_tables_by_country$CO,
+  filename = "Model_1_Colombia_Coef.png",
+  vwidth = 1600,
+  vheight = 800
+)
+
+#Model Diagnositcs
+diag_one_quasi <- function(df) {
+  
+  mod_q <- glm(
+    p ~ time + pct_under30_c + pct_primary_c + pct_secplus_c,
+    family = quasibinomial(),
+    weights = N_women,
+    data = df
+  )
+  
+  # Predictions (probability scale)
+  p_hat <- predict(mod_q, type = "response")
+  m_obs <- 100 * df$p
+  m_hat <- 100 * p_hat
+  
+  # Error metrics (percentage points)
+  rmse <- sqrt(mean((m_obs - m_hat)^2, na.rm = TRUE))
+  mae  <- mean(abs(m_obs - m_hat), na.rm = TRUE)
+  cor_ <- suppressWarnings(cor(m_obs, m_hat, use = "complete.obs"))
+  
+  # Deviance-based pseudo-R²
+  null_dev  <- mod_q$null.deviance
+  resid_dev <- mod_q$deviance
+  pseudoR2_dev <- ifelse(
+    is.finite(null_dev) && null_dev > 0,
+    1 - resid_dev / null_dev,
+    NA_real_
+  )
+  
+  # Overdispersion (phi)
+  rp <- residuals(mod_q, type = "pearson")
+  phi <- sum(rp^2, na.rm = TRUE) / df.residual(mod_q)
+  
+  # Influence (Cook's distance)
+  cd <- cooks.distance(mod_q)
+  max_cook <- max(cd, na.rm = TRUE)
+  
+  tibble(
+    n_surveys = nrow(df),
+    pseudoR2_dev = pseudoR2_dev,
+    rmse_pp = rmse,
+    mae_pp = mae,
+    cor_obs_fit = cor_,
+    phi_overdisp = phi,
+    max_cooksD = max_cook
+  )
+}
+
+model_diagnostics <- mcpr_long %>%
+  group_by(country_code, outcome) %>%
+  group_modify(~ diag_one_quasi(.x)) %>%
+  ungroup() %>%
+  mutate(
+    outcome = recode(outcome,
+                     mCPR_4methods = "4 methods combined",
+                     mCPR_pill     = "Pill",
+                     mCPR_iud      = "IUD",
+                     mCPR_inj      = "Injectables",
+                     mCPR_imp      = "Implants"
+    )
+  ) %>%
+  arrange(country_code, outcome)
+
+model_diagnostics
+model_diagnostics %>% print(n=30)
+
+#Nice tables of model Diagnostics by Country
+diagnostics_tables_by_country <- model_diagnostics %>%
+  group_split(country_code) %>%
+  setNames(unique(model_diagnostics$country_code)) %>%
+  purrr::map(~{
+    gt(.x) %>%
+      fmt_number(
+        columns = c(pseudoR2_dev, cor_obs_fit),
+        decimals = 3
+      ) %>%
+      fmt_number(
+        columns = c(rmse_pp, mae_pp, phi_overdisp, max_cooksD),
+        decimals = 2
+      ) %>%
+      cols_label(
+        outcome = "Outcome",
+        n_surveys = "# surveys",
+        pseudoR2_dev = "Pseudo-R² (deviance)",
+        rmse_pp = "RMSE (pp)",
+        mae_pp = "MAE (pp)",
+        cor_obs_fit = "Corr(obs, fit)",
+        phi_overdisp = "Overdispersion (φ)",
+        max_cooksD = "Max Cook’s D"
+      ) %>%
+      tab_header(
+        title = "Model diagnostics by method",
+        subtitle = paste("Country:", unique(.x$country_code))
+      ) %>%
+      tab_source_note(
+        source_note = "Diagnostics from country-specific quasibinomial logistic regression models. Pseudo-R² is deviance-based; φ indicates overdispersion; Cook’s D highlights influential surveys."
+      )
+  })
+
+# View (example Colombia)
+diagnostics_tables_by_country$CO
+
+
+# ---------------------------------------------------------------------
+#7. PLOTS MODEL 1: NEW CASE STUDIES: mCPR TREND (all modern methods) by Survey & for 4 Methods of interest
+# ---------------------------------------------------------------------
+
+#Let's Plot Model 1 for each country
+
+# Add fitted values per country × outcome
+mcpr_fitted <- mcpr_long %>%
+  group_by(country_code, outcome) %>%
+  group_modify(~{
+    mod <- glm(
+      p ~ time + pct_under30_c + pct_primary_c + pct_secplus_c,
+      family = quasibinomial(),
+      weights = N_women,
+      data = .x
+    )
+    
+    .x %>%
+      mutate(
+        p_hat = predict(mod, type = "response"),
+        mCPR_hat = 100 * p_hat
+      )
+  }) %>%
+  ungroup()
+
+
+# Optional: nicer legend labels
+outcome_labels <- c(
+  mCPR_4methods = "4 methods combined",
+  mCPR_pill     = "Pill",
+  mCPR_iud      = "IUD",
+  mCPR_inj      = "Injectables",
+  mCPR_imp      = "Implants"
+)
+
+# Build fitted values + 95% CI for every country × outcome
+mcpr_fitted_ci <- mcpr_long %>%
+  group_by(country_code, outcome) %>%
+  group_modify(~{
+    mod <- glm(
+      p ~ time + pct_under30_c + pct_primary_c + pct_secplus_c,
+      family = quasibinomial(),
+      weights = N_women,
+      data = .x
+    )
+    
+    pr <- predict(mod, type = "link", se.fit = TRUE)
+    
+    .x %>%
+      mutate(
+        eta_hat  = pr$fit,
+        eta_low  = pr$fit - 1.96 * pr$se.fit,
+        eta_high = pr$fit + 1.96 * pr$se.fit,
+        p_hat    = plogis(eta_hat),
+        p_low    = plogis(eta_low),
+        p_high   = plogis(eta_high),
+        mCPR_hat = 100 * p_hat,
+        mCPR_low = 100 * p_low,
+        mCPR_high= 100 * p_high
+      )
+  }) %>%
+  ungroup() %>%
+  mutate(
+    outcome_lab = recode(outcome, !!!outcome_labels)
+  )
+
+# Plot function for one country
+plot_country_fit_ci <- function(cc) {
+  df <- mcpr_fitted_ci %>% filter(country_code == cc)
+  
+  ggplot(df, aes(x = survey_year)) +
+    geom_ribbon(aes(ymin = mCPR_low, ymax = mCPR_high, fill = outcome_lab),
+                alpha = 0.18, color = NA) +
+    geom_line(aes(y = mCPR_hat, color = outcome_lab), linewidth = 1) +
+    geom_point(aes(y = mCPR, color = outcome_lab), size = 2) +
+    facet_wrap(~ outcome_lab, scales = "free_y") +
+    labs(
+      title = paste("Observed vs fitted mCPR (with 95% CI) —", cc),
+      x = "Survey year",
+      y = "mCPR (%)",
+      color = NULL,
+      fill = NULL
+    ) +
+    theme_minimal() +
+    theme(legend.position = "none")
+}
+
+plot_country_fit_ci("CO")
+plot_country_fit_ci("ZW")
+plot_country_fit_ci("PE")
+plot_country_fit_ci("SN")
+plot_country_fit_ci("EG")
+plot_country_fit_ci("RW")
+
+
+# ---------------------------------------------------------------------
+#8. MODEL 2: Quadratic diagnostic model at Survey level for 4 Methods of interest
+# ---------------------------------------------------------------------
+
+#Center time for easier interpretation
+mcpr_long <- mcpr_methods_survey %>%
+  left_join(survey_covs, by = c("v000", "country_code", "survey_year")) %>%
+  group_by(country_code) %>%
+  mutate(
+    time = survey_year - min(survey_year, na.rm = TRUE),
+    
+    # keep your centered covariates
+    pct_under30_c = pct_under30 - mean(pct_under30, na.rm = TRUE),
+    pct_primary_c = pct_primary - mean(pct_primary, na.rm = TRUE),
+    pct_secplus_c = pct_secplus - mean(pct_secplus, na.rm = TRUE),
+    
+    # NEW: center time, then square it
+    time_c = time - mean(time, na.rm = TRUE),
+    time_c2 = time_c^2
+  ) %>%
+  ungroup() %>%
+  pivot_longer(
+    cols = c(mCPR_4methods, mCPR_pill, mCPR_iud, mCPR_inj, mCPR_imp),
+    names_to = "outcome",
+    values_to = "mCPR"
+  ) %>%
+  mutate(p = mCPR / 100) %>%
+  filter(!is.na(p), N_women > 0)
+
+#Quadratic model
+fit_one <- function(df) {
+  glm(
+    p ~ time_c + time_c2 + pct_under30_c + pct_primary_c + pct_secplus_c,
+    family = quasibinomial(),
+    weights = N_women,
+    data = df
+  )
+}
+
+
+models <- mcpr_long %>%
+  dplyr::group_by(country_code, outcome) %>%
+  dplyr::group_map(~ fit_one(.x), .keep = TRUE)
+
+model_keys <- mcpr_long %>%
+  dplyr::distinct(country_code, outcome) %>%
+  dplyr::arrange(country_code, outcome)
+
+
+# --- STEP 4 (REUSE): Robust SEs + CIs (no change needed to tidy_robust())
+# results object is rebuilt from the updated 'models'
+results <- purrr::map2_df(
+  models,
+  split(model_keys, seq_len(nrow(model_keys))),
+  ~ tidy_robust(.x) %>%
+    dplyr::mutate(country_code = .y$country_code,
+                  outcome      = .y$outcome)
+) %>%
+  dplyr::mutate(
+    OR      = exp(estimate),
+    OR_low  = exp(estimate - 1.96 * std.error),
+    OR_high = exp(estimate + 1.96 * std.error)
+  )
+
+# NOTE: Under quadratic time, there is no single "OR per year" term.
+# You’ll usually examine BOTH time terms:
+time_terms <- results %>%
+  dplyr::filter(term %in% c("time_c", "time_c2")) %>%
+  dplyr::arrange(country_code, outcome, term)
+
+# Optional: pretty time-term table
+country_time_summary_quad <- time_terms %>%
+  dplyr::mutate(
+    outcome = dplyr::recode(outcome,
+                            mCPR_4methods = "4 methods combined",
+                            mCPR_pill     = "Pill",
+                            mCPR_iud      = "IUD",
+                            mCPR_inj      = "Injectables",
+                            mCPR_imp      = "Implants"
+    ),
+    term = dplyr::recode(term,
+                         "time_c"  = "Time (centered)",
+                         "time_c2" = "Time² (centered)"
+    )
+  ) %>%
+  dplyr::select(country_code, outcome, term, estimate, std.error, p.value) %>%
+  dplyr::arrange(country_code, outcome, term)
+
+print(country_time_summary_quad, n = 30)
+
+
+# ------------------------------------------------------------
+# DIAGNOSTICS (REPLACE): same diagnostics, quadratic formula
+# ------------------------------------------------------------
+diag_one_quasi <- function(df) {
+  
+  mod_q <- glm(
+    p ~ time_c + time_c2 + pct_under30_c + pct_primary_c + pct_secplus_c,
+    family  = quasibinomial(),
+    weights = N_women,
+    data    = df
+  )
+  
+  # Predictions (probability scale)
+  p_hat <- predict(mod_q, type = "response")
+  m_obs <- 100 * df$p
+  m_hat <- 100 * p_hat
+  
+  # Error metrics (percentage points)
+  rmse <- sqrt(mean((m_obs - m_hat)^2, na.rm = TRUE))
+  mae  <- mean(abs(m_obs - m_hat), na.rm = TRUE)
+  cor_ <- suppressWarnings(cor(m_obs, m_hat, use = "complete.obs"))
+  
+  # Deviance-based pseudo-R²
+  null_dev  <- mod_q$null.deviance
+  resid_dev <- mod_q$deviance
+  pseudoR2_dev <- ifelse(
+    is.finite(null_dev) && null_dev > 0,
+    1 - resid_dev / null_dev,
+    NA_real_
+  )
+  
+  # Overdispersion (phi)
+  rp <- residuals(mod_q, type = "pearson")
+  phi <- sum(rp^2, na.rm = TRUE) / df.residual(mod_q)
+  
+  # Influence (Cook's distance)
+  cd <- cooks.distance(mod_q)
+  max_cook <- max(cd, na.rm = TRUE)
+  
+  tibble::tibble(
+    n_surveys     = nrow(df),
+    pseudoR2_dev  = pseudoR2_dev,
+    rmse_pp       = rmse,
+    mae_pp        = mae,
+    cor_obs_fit   = cor_,
+    phi_overdisp  = phi,
+    max_cooksD    = max_cook
+  )
+}
+
+model_diagnostics <- mcpr_long %>%
+  dplyr::group_by(country_code, outcome) %>%
+  dplyr::group_modify(~ diag_one_quasi(.x)) %>%
+  dplyr::ungroup() %>%
+  dplyr::mutate(
+    outcome = dplyr::recode(outcome,
+                            mCPR_4methods = "4 methods combined",
+                            mCPR_pill     = "Pill",
+                            mCPR_iud      = "IUD",
+                            mCPR_inj      = "Injectables",
+                            mCPR_imp      = "Implants"
+    )
+  ) %>%
+  dplyr::arrange(country_code, outcome)
+
+model_diagnostics %>% print(n = 30)
+
+
+# ------------------------------------------------------------
+# PLOTS (REPLACE): fitted values + 95% CI for quadratic model
+# ------------------------------------------------------------
+# Optional: nicer legend labels (same as before)
+outcome_labels <- c(
+  mCPR_4methods = "4 methods combined",
+  mCPR_pill     = "Pill",
+  mCPR_iud      = "IUD",
+  mCPR_inj      = "Injectables",
+  mCPR_imp      = "Implants"
+)
+
+mcpr_fitted_ci <- mcpr_long %>%
+  dplyr::group_by(country_code, outcome) %>%
+  dplyr::group_modify(~{
+    mod <- glm(
+      p ~ time_c + time_c2 + pct_under30_c + pct_primary_c + pct_secplus_c,
+      family  = quasibinomial(),
+      weights = N_women,
+      data    = .x
+    )
+    
+    pr <- predict(mod, type = "link", se.fit = TRUE)
+    
+    .x %>%
+      dplyr::mutate(
+        eta_hat  = pr$fit,
+        eta_low  = pr$fit - 1.96 * pr$se.fit,
+        eta_high = pr$fit + 1.96 * pr$se.fit,
+        p_hat    = plogis(eta_hat),
+        p_low    = plogis(eta_low),
+        p_high   = plogis(eta_high),
+        mCPR_hat = 100 * p_hat,
+        mCPR_low = 100 * p_low,
+        mCPR_high= 100 * p_high
+      )
+  }) %>%
+  dplyr::ungroup() %>%
+  dplyr::mutate(outcome_lab = dplyr::recode(outcome, !!!outcome_labels))
+
+
+# Plot function (same as before)
+plot_country_fit_ci <- function(cc) {
+  df <- mcpr_fitted_ci %>% dplyr::filter(country_code == cc)
+  
+  ggplot2::ggplot(df, ggplot2::aes(x = survey_year)) +
+    ggplot2::geom_ribbon(
+      ggplot2::aes(ymin = mCPR_low, ymax = mCPR_high, fill = outcome_lab),
+      alpha = 0.18, color = NA
+    ) +
+    ggplot2::geom_line(
+      ggplot2::aes(y = mCPR_hat, color = outcome_lab),
+      linewidth = 1
+    ) +
+    ggplot2::geom_point(
+      ggplot2::aes(y = mCPR, color = outcome_lab),
+      size = 2
+    ) +
+    ggplot2::facet_wrap(~ outcome_lab, scales = "free_y") +
+    ggplot2::labs(
+      title = paste("Observed vs fitted mCPR (Quadratic time; 95% CI) —", cc),
+      x = "Survey year",
+      y = "mCPR (%)",
+      color = NULL,
+      fill = NULL
+    ) +
+    ggplot2::theme_minimal() +
+    ggplot2::theme(legend.position = "none")
+}
+
+#View plot (Colombia Example)
+plot_country_fit_ci("CO")
+
+
+# ------------------------------------------------------------
+# BASELINE FOR COEF TABLES (REPLACE): use quadratic fitted CI object
+# (same logic as before; now uses updated mcpr_fitted_ci)
+# ------------------------------------------------------------
+baseline_from_plot <- mcpr_fitted_ci %>%
+  dplyr::group_by(country_code, outcome) %>%
+  dplyr::slice_min(survey_year, with_ties = FALSE) %>%
+  dplyr::ungroup() %>%
+  dplyr::transmute(
+    country_code,
+    outcome,
+    baseline_year = survey_year,
+    baseline_mCPR = mCPR_hat,
+    baseline_low  = mCPR_low,
+    baseline_high = mCPR_high
+  ) %>%
+  dplyr::mutate(
+    outcome = dplyr::recode(outcome,
+                            mCPR_4methods = "4 methods combined",
+                            mCPR_pill     = "Pill",
+                            mCPR_iud      = "IUD",
+                            mCPR_inj      = "Injectables",
+                            mCPR_imp      = "Implants"
+    )
+  )
+
+baseline_from_plot("CO")
+
+
+# ---------------------------------------------------------------------
+#9. MODEL 3: Log-time diagnostic model at Survey level for 4 Methods of interest
+# ---------------------------------------------------------------------
+
+# ============================================================
+# LOG(TIME+1) MODEL: REPLACEMENT CODE AFTER STEP 3
+# (Consistent across: models, robust SEs, diagnostics, plots,
+#  and baseline-from-plot for coef tables)
+# ============================================================
+
+# --- (Prereq) If not already created in Step 2, add log-time to mcpr_long
+# Keep your existing 'time' as years since first survey (>=0)
+mcpr_long <- mcpr_long %>%
+  dplyr::mutate(log_time = log(time + 1))
+
+# ------------------------------------------------------------
+# STEP 3 (REPLACE): Fit the log-time model (per country × outcome)
+# ------------------------------------------------------------
+fit_one <- function(df) {
+  glm(
+    p ~ log_time + pct_under30_c + pct_primary_c + pct_secplus_c,
+    family  = quasibinomial(),
+    weights = N_women,
+    data    = df
+  )
+}
+
+models <- mcpr_long %>%
+  dplyr::group_by(country_code, outcome) %>%
+  dplyr::group_map(~ fit_one(.x), .keep = TRUE)
+
+model_keys <- mcpr_long %>%
+  dplyr::distinct(country_code, outcome) %>%
+  dplyr::arrange(country_code, outcome)
+
+
+# ------------------------------------------------------------
+# STEP 4 (REBUILD): Robust SEs + ORs (term is now 'log_time')
+# ------------------------------------------------------------
+results <- purrr::map2_df(
+  models,
+  split(model_keys, seq_len(nrow(model_keys))),
+  ~ tidy_robust(.x) %>%
+    dplyr::mutate(country_code = .y$country_code,
+                  outcome      = .y$outcome)
+) %>%
+  dplyr::mutate(
+    OR      = exp(estimate),
+    OR_low  = exp(estimate - 1.96 * std.error),
+    OR_high = exp(estimate + 1.96 * std.error)
+  )
+
+log_time_term <- results %>%
+  dplyr::filter(term == "log_time") %>%
+  dplyr::arrange(country_code, outcome)
+
+# Optional: nice summary table for the log-time coefficient
+country_logtime_summary <- log_time_term %>%
+  dplyr::mutate(
+    outcome = dplyr::recode(outcome,
+                            mCPR_4methods = "4 methods combined",
+                            mCPR_pill     = "Pill",
+                            mCPR_iud      = "IUD",
+                            mCPR_inj      = "Injectables",
+                            mCPR_imp      = "Implants"
+    ),
+    trend = dplyr::case_when(
+      OR_low  > 1 ~ "Increasing (log-time)",
+      OR_high < 1 ~ "Decreasing (log-time)",
+      TRUE        ~ "No clear change"
+    )
+  ) %>%
+  dplyr::select(country_code, outcome, estimate, std.error, OR, OR_low, OR_high, p.value, trend) %>%
+  dplyr::arrange(country_code, outcome)
+
+print(country_logtime_summary, n = 30)
+
+
+# ------------------------------------------------------------
+# DIAGNOSTICS (REPLACE): log-time model
+# ------------------------------------------------------------
+diag_one_quasi <- function(df) {
+  
+  mod_q <- glm(
+    p ~ log_time + pct_under30_c + pct_primary_c + pct_secplus_c,
+    family  = quasibinomial(),
+    weights = N_women,
+    data    = df
+  )
+  
+  p_hat <- predict(mod_q, type = "response")
+  m_obs <- 100 * df$p
+  m_hat <- 100 * p_hat
+  
+  rmse <- sqrt(mean((m_obs - m_hat)^2, na.rm = TRUE))
+  mae  <- mean(abs(m_obs - m_hat), na.rm = TRUE)
+  cor_ <- suppressWarnings(cor(m_obs, m_hat, use = "complete.obs"))
+  
+  null_dev  <- mod_q$null.deviance
+  resid_dev <- mod_q$deviance
+  pseudoR2_dev <- ifelse(is.finite(null_dev) && null_dev > 0, 1 - resid_dev / null_dev, NA_real_)
+  
+  rp  <- residuals(mod_q, type = "pearson")
+  phi <- sum(rp^2, na.rm = TRUE) / df.residual(mod_q)
+  
+  cd <- cooks.distance(mod_q)
+  max_cook <- max(cd, na.rm = TRUE)
+  
+  tibble::tibble(
+    n_surveys     = nrow(df),
+    pseudoR2_dev  = pseudoR2_dev,
+    rmse_pp       = rmse,
+    mae_pp        = mae,
+    cor_obs_fit   = cor_,
+    phi_overdisp  = phi,
+    max_cooksD    = max_cook
+  )
+}
+
+model_diagnostics <- mcpr_long %>%
+  dplyr::group_by(country_code, outcome) %>%
+  dplyr::group_modify(~ diag_one_quasi(.x)) %>%
+  dplyr::ungroup() %>%
+  dplyr::mutate(
+    outcome = dplyr::recode(outcome,
+                            mCPR_4methods = "4 methods combined",
+                            mCPR_pill     = "Pill",
+                            mCPR_iud      = "IUD",
+                            mCPR_inj      = "Injectables",
+                            mCPR_imp      = "Implants"
+    )
+  ) %>%
+  dplyr::arrange(country_code, outcome)
+
+model_diagnostics %>% print(n = 30)
+
+
+# ------------------------------------------------------------
+# PLOTS (REPLACE): fitted values + 95% CI for log-time model
+# ------------------------------------------------------------
+outcome_labels <- c(
+  mCPR_4methods = "4 methods combined",
+  mCPR_pill     = "Pill",
+  mCPR_iud      = "IUD",
+  mCPR_inj      = "Injectables",
+  mCPR_imp      = "Implants"
+)
+
+mcpr_fitted_ci <- mcpr_long %>%
+  dplyr::group_by(country_code, outcome) %>%
+  dplyr::group_modify(~{
+    mod <- glm(
+      p ~ log_time + pct_under30_c + pct_primary_c + pct_secplus_c,
+      family  = quasibinomial(),
+      weights = N_women,
+      data    = .x
+    )
+    
+    pr <- predict(mod, type = "link", se.fit = TRUE)
+    
+    .x %>%
+      dplyr::mutate(
+        eta_hat  = pr$fit,
+        eta_low  = pr$fit - 1.96 * pr$se.fit,
+        eta_high = pr$fit + 1.96 * pr$se.fit,
+        p_hat    = plogis(eta_hat),
+        p_low    = plogis(eta_low),
+        p_high   = plogis(eta_high),
+        mCPR_hat = 100 * p_hat,
+        mCPR_low = 100 * p_low,
+        mCPR_high= 100 * p_high
+      )
+  }) %>%
+  dplyr::ungroup() %>%
+  dplyr::mutate(outcome_lab = dplyr::recode(outcome, !!!outcome_labels))
+
+plot_country_fit_ci <- function(cc) {
+  df <- mcpr_fitted_ci %>% dplyr::filter(country_code == cc)
+  
+  ggplot2::ggplot(df, ggplot2::aes(x = survey_year)) +
+    ggplot2::geom_ribbon(
+      ggplot2::aes(ymin = mCPR_low, ymax = mCPR_high, fill = outcome_lab),
+      alpha = 0.18, color = NA
+    ) +
+    ggplot2::geom_line(
+      ggplot2::aes(y = mCPR_hat, color = outcome_lab),
+      linewidth = 1
+    ) +
+    ggplot2::geom_point(
+      ggplot2::aes(y = mCPR, color = outcome_lab),
+      size = 2
+    ) +
+    ggplot2::facet_wrap(~ outcome_lab, scales = "free_y") +
+    ggplot2::labs(
+      title = paste("Observed vs fitted mCPR (Log(time+1); 95% CI) —", cc),
+      x = "Survey year",
+      y = "mCPR (%)",
+      color = NULL,
+      fill  = NULL
+    ) +
+    ggplot2::theme_minimal() +
+    ggplot2::theme(legend.position = "none")
+}
+
+# Example:
+plot_country_fit_ci("CO")
+
+
+# ------------------------------------------------------------
+# BASELINE FOR COEF TABLES (REPLACE): baseline from fitted CI
+# ------------------------------------------------------------
+baseline_from_plot <- mcpr_fitted_ci %>%
+  dplyr::group_by(country_code, outcome) %>%
+  dplyr::slice_min(survey_year, with_ties = FALSE) %>%
+  dplyr::ungroup() %>%
+  dplyr::transmute(
+    country_code,
+    outcome,
+    baseline_year = survey_year,
+    baseline_mCPR = mCPR_hat,
+    baseline_low  = mCPR_low,
+    baseline_high = mCPR_high
+  ) %>%
+  dplyr::mutate(
+    outcome = dplyr::recode(outcome,
+                            mCPR_4methods = "4 methods combined",
+                            mCPR_pill     = "Pill",
+                            mCPR_iud      = "IUD",
+                            mCPR_inj      = "Injectables",
+                            mCPR_imp      = "Implants"
+    )
+  )
+
+
