@@ -1,0 +1,356 @@
+# ============================================================
+# Global method trajectories (country-adjusted) with covariates
+# Covariates: % under 30, % secondary+
+# Outcomes: 4-method total, pill, IUD, implant, injectables
+# Model: mcpr_ct = f(year) + b_country + beta*covs_ct + error
+# ============================================================
+
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(mgcv)
+library(ggplot2)
+
+# ----------------------------
+# 0) PREP
+# ----------------------------
+# dhs already exists and includes:
+# v000, v012, v106, v005, survey_year
+# and binary indicators: fp_cruse_pill, fp_cruse_iud, fp_cruse_imp, fp_cruse_inj
+# plus mcpr_4methods (pill OR iud OR imp OR inj)
+
+# We define indicators for ALL women 15-49 (no union subset).
+dhs <- dhs %>%
+  mutate(
+    fp_cruse_pill = as.numeric(v312 == 1),
+    fp_cruse_iud  = as.numeric(v312 == 2),
+    fp_cruse_inj  = as.numeric(v312 == 3),
+    fp_cruse_imp  = as.numeric(v312 == 11),
+    
+    # 4-method mCPR indicator (pill/IUD/inj/imp)
+    mcpr_4methods = as.numeric(
+      fp_cruse_pill == 1 | fp_cruse_iud == 1 | fp_cruse_inj == 1 | fp_cruse_imp == 1
+    )
+  )
+
+# Required derived variables (create them if they don't exist)
+dhs <- dhs %>%
+  mutate(
+    # sampling weight
+    w = v005 / 1e6,
+    
+    # denominator: all women aged 15–49
+    in_den = !is.na(v012) & v012 >= 15 & v012 <= 49
+  )
+
+
+dhs <- dhs %>%
+  mutate(
+    v000 = as.character(v000),
+    country = substr(v000, 1, 2),
+    
+    is_ethiopia = grepl("^ET", v000),
+    is_nepal    = grepl("^NP", v000),
+    is_nepal_1996 = (v000 == "NP3"),  # keep your special-case
+    
+    v008_harmon = case_when(
+      is_ethiopia ~ v008 + 92,                 # Ethiopia +92 months
+      is_nepal & !is_nepal_1996 ~ v008 - 681,  # Nepal standard -681
+      is_nepal_1996 ~ v008 + 519,              # Nepal 1996 +519
+      TRUE ~ v008
+    ),
+    
+    survey_year = 1900 + floor((v008_harmon - 1) / 12)
+  )
+
+# ------------------------------------------------------------
+# 2) EXCLUDE NON-FP SURVEYS WITH 100% MISSING v312 & <1 Survery
+# ------------------------------------------------------------
+survey_missingness <- dhs %>%
+  group_by(v000) %>%
+  summarise(
+    total_rows = n(),
+    n_NAs_v312 = sum(is.na(v312)),
+    pct_NAs = (n_NAs_v312 / total_rows) * 100,
+    .groups = "drop"
+  ) %>%
+  filter(pct_NAs == 100) %>%
+  pull(v000)
+
+dhs <- dhs %>% filter(!v000 %in% survey_missingness)
+
+#remove surveys with only 1 survey
+dhs <- dhs %>%
+  mutate(country = substr(as.character(v000), 1, 2)) %>%
+  group_by(country) %>%
+  filter(n_distinct(v000) >= 2) %>%
+  ungroup()
+
+# ----------------------------
+# 1) COUNTRY–YEAR OUTCOMES (mCPR, in %)
+# ----------------------------
+country_year_outcomes <- dhs %>%
+  filter(in_den, !is.na(survey_year)) %>%
+  mutate(country_code = substr(as.character(v000), 1, 2)) %>%
+  group_by(country_code, survey_year) %>%
+  summarise(
+    N_women = sum(w, na.rm = TRUE),
+    
+    mCPR_4methods = weighted.mean(mcpr_4methods, w, na.rm = TRUE) * 100,
+    mCPR_pill     = weighted.mean(fp_cruse_pill, w, na.rm = TRUE) * 100,
+    mCPR_iud      = weighted.mean(fp_cruse_iud,  w, na.rm = TRUE) * 100,
+    mCPR_imp      = weighted.mean(fp_cruse_imp,  w, na.rm = TRUE) * 100,
+    mCPR_inj      = weighted.mean(fp_cruse_inj,  w, na.rm = TRUE) * 100,
+    .groups = "drop"
+  ) %>%
+  filter(!is.na(N_women), N_women > 0)
+
+# ----------------------------
+# 2) COUNTRY–YEAR COVARIATES (% under 30, % secondary+)
+# ----------------------------
+country_year_covs <- dhs %>%
+  filter(in_den, !is.na(survey_year)) %>%
+  mutate(
+    country_code = substr(as.character(v000), 1, 2),
+    under30 = as.numeric(v012 >= 15 & v012 <= 29),
+    secplus = as.numeric(v106 %in% c(2, 3))  # 2=secondary, 3=higher
+  ) %>%
+  group_by(country_code, survey_year) %>%
+  summarise(
+    pct_under30 = weighted.mean(under30, w, na.rm = TRUE) * 100,
+    pct_secplus = weighted.mean(secplus, w, na.rm = TRUE) * 100,
+    .groups = "drop"
+  )
+
+# ----------------------------
+# 3) MERGE + WEIGHTS TO HANDLE OVERREPRESENTATION
+#    wt = N_women / (# surveys in country)
+# ----------------------------
+country_year <- country_year_outcomes %>%
+  left_join(country_year_covs, by = c("country_code", "survey_year")) %>%
+  mutate(
+    country_code = factor(country_code),
+    survey_year = as.numeric(survey_year)
+  ) %>%
+  group_by(country_code) %>%
+  mutate(
+    n_surveys_country = n(),
+    wt = N_women / n_surveys_country
+  ) %>%
+  ungroup() %>%
+  mutate(
+    wt = ifelse(is.finite(wt) & wt > 0, wt, NA_real_)
+  )
+
+# ----------------------------
+# 4) CENTER COVARIATES WITHIN COUNTRY (recommended)
+# ----------------------------
+country_year <- country_year %>%
+  group_by(country_code) %>%
+  mutate(
+    pct_under30_c = pct_under30 - mean(pct_under30, na.rm = TRUE),
+    pct_secplus_c = pct_secplus - mean(pct_secplus, na.rm = TRUE)
+  ) %>%
+  ungroup()
+
+# ----------------------------
+# 5) LONG FORMAT FOR MODELING
+# ----------------------------
+cy_long <- country_year %>%
+  pivot_longer(
+    cols = c(mCPR_4methods, mCPR_pill, mCPR_iud, mCPR_imp, mCPR_inj),
+    names_to = "outcome",
+    values_to = "mcpr"
+  ) %>%
+  filter(
+    !is.na(mcpr),
+    !is.na(wt),
+    !is.na(pct_under30_c),
+    !is.na(pct_secplus_c)
+  ) %>%
+  mutate(
+    outcome = factor(
+      outcome,
+      levels = c("mCPR_4methods","mCPR_pill","mCPR_iud","mCPR_imp","mCPR_inj"),
+      labels = c("4-method total","Pill","IUD","Implant","Injectables")
+    )
+  )
+
+# ----------------------------
+# 6) FIT MODEL PER OUTCOME (GAM + country random intercept)
+#    mcpr_ct = f(year) + beta1*under30 + beta2*secplus + b_country + error
+# ----------------------------
+fit_gam_re <- function(df, k = 10) {
+  mgcv::gam(
+    mcpr ~ s(survey_year, k = k, bs = "cs") +
+      pct_under30_c + pct_secplus_c +
+      s(country_code, bs = "re"),
+    data = df,
+    weights = wt,
+    method = "REML"
+  )
+}
+
+# Fit safely (so one problematic outcome won't crash everything)
+mods_tbl <- cy_long %>%
+  group_by(outcome) %>%
+  group_split() %>%
+  setNames(levels(cy_long$outcome)) %>%
+  purrr::imap(~ list(
+    outcome = .y,
+    model = tryCatch(fit_gam_re(.x, k = 10), error = function(e) e)
+  ))
+
+fail <- purrr::keep(mods_tbl, ~ inherits(.x$model, "error"))
+ok   <- purrr::keep(mods_tbl, ~ !inherits(.x$model, "error"))
+
+if (length(fail) > 0) {
+  cat("Some outcomes failed:\n")
+  print(purrr::map(fail, ~ paste(.x$outcome, ":", .x$model$message)))
+}
+
+mods <- purrr::map(ok, "model")
+names(mods) <- purrr::map_chr(ok, "outcome")
+
+# ----------------------------
+# 7) SUMMARIES (parametric terms + smooth term significance)
+# ----------------------------
+# ----------------------------
+# 7) SUMMARIES (parametric terms + smooth term significance)
+# ----------------------------
+# Parametric terms: intercept + age composition
+param_terms <- purrr::imap_dfr(mods, function(m, nm) {
+  s <- summary(m)
+  
+  tibble(
+    outcome  = nm,
+    term     = rownames(s$p.table),
+    estimate = s$p.table[, "Estimate"],
+    se       = s$p.table[, "Std. Error"],
+    t        = s$p.table[, "t value"],
+    p        = s$p.table[, "Pr(>|t|)"]
+  )
+}) %>%
+  filter(term %in% c("(Intercept)", "pct_under30_c"))
+
+print(param_terms)
+
+
+# ----------------------------
+# 8) PREDICT GLOBAL TRAJECTORY (holding covariates at 0 => country means)
+#    Exclude random intercept term to get "global" curve
+# ----------------------------
+# ----------------------------
+# 8) PREDICT GLOBAL TRAJECTORY (holding covariates at 0 => country means)
+#    Exclude random intercept term to get "global" curve
+# ----------------------------
+
+year_grid <- seq(
+  min(country_year$survey_year, na.rm = TRUE),
+  max(country_year$survey_year, na.rm = TRUE),
+  by = 0.1
+)
+
+ref_country <- levels(country_year$country_code)[1]
+
+pred_df <- purrr::imap_dfr(mods, function(mod, outcome_nm) {
+  
+  newd <- data.frame(
+    survey_year     = year_grid,
+    pct_under30_c   = 0,
+    pct_secplus_c   = 0,
+    country_code    = ref_country
+  )
+  
+  pr <- predict(mod, newdata = newd, se.fit = TRUE, exclude = "s(country_code)")
+  
+  tibble(
+    outcome     = outcome_nm,
+    survey_year = year_grid,
+    fit         = as.numeric(pr$fit),
+    lo          = as.numeric(pr$fit - 1.96 * pr$se.fit),
+    hi          = as.numeric(pr$fit + 1.96 * pr$se.fit)
+  )
+})
+
+print(head(pred_df))
+
+# ----------------------------
+# 9) PLOT: COUNTRY–YEAR POINTS + GLOBAL CURVE + 95% CI
+# ----------------------------
+p <- ggplot() +
+  geom_point(
+    data = cy_long,
+    aes(x = survey_year, y = mcpr),
+    alpha = 0.25,
+    size = 1.4
+  ) +
+  geom_ribbon(
+    data = pred_df,
+    aes(x = survey_year, ymin = lo, ymax = hi),
+    alpha = 0.18
+  ) +
+  geom_line(
+    data = pred_df,
+    aes(x = survey_year, y = fit),
+    linewidth = 1
+  ) +
+  facet_wrap(~ outcome, scales = "free_y", ncol = 2) +
+  labs(
+    title = "Global method trajectories (country-adjusted, covariate-adjusted)",
+    subtitle = "Points = country-year mCPR; line = global smooth; ribbon = 95% CI; covariates held at country means",
+    x = "Survey year",
+    y = "mCPR (%)"
+  ) +
+  theme_minimal(base_size = 13)
+
+print(p)
+
+
+# Extract co-variates
+covariate_effects <- param_terms %>%
+  mutate(
+    ci_low  = estimate - 1.96 * se,
+    ci_high = estimate + 1.96 * se
+  ) %>%
+  select(outcome, term, estimate, ci_low, ci_high, p)
+
+print(covariate_effects)
+
+#Extract time trend
+time_trends <- purrr::imap_dfr(mods, function(m, nm) {
+  s <- summary(m)
+  tibble(
+    outcome = nm,
+    edf     = s$s.table[, "edf"],
+    F       = s$s.table[, "F"],
+    p       = s$s.table[, "p-value"]
+  )
+})
+
+print(time_trends)
+
+#Country heterogeneity (random effects)
+country_re <- purrr::imap_dfr(mods, function(m, nm) {
+  re_sd <- sqrt(m$sp[grep("country_code", names(m$sp))])
+  tibble(
+    outcome = nm,
+    country_sd = re_sd
+  )
+})
+
+print(country_re)
+
+#Model diagnostics
+model_diag <- purrr::imap_dfr(mods, function(m, nm) {
+  s <- summary(m)
+  tibble(
+    outcome = nm,
+    r_sq    = s$r.sq,
+    dev_exp = s$dev.expl * 100,
+    n       = s$n
+  )
+})
+
+print(model_diag)
+
